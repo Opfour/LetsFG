@@ -447,22 +447,40 @@ search_and_book(
 )
 ```
 
-### Bash — CLI Workflow
+### Bash — CLI Workflow (Production)
 
 ```bash
 #!/bin/bash
+set -euo pipefail
 export BOOSTEDTRAVEL_API_KEY=trav_...
 
-# Resolve
+# Step 1: Resolve locations (with validation)
 ORIGIN=$(boostedtravel locations "London" --json | jq -r '.[0].iata_code')
 DEST=$(boostedtravel locations "Barcelona" --json | jq -r '.[0].iata_code')
 
-# Search
+if [ -z "$ORIGIN" ] || [ -z "$DEST" ]; then
+  echo "Error: Could not resolve locations" >&2
+  exit 1
+fi
+
+# Step 2: Search
 RESULTS=$(boostedtravel search "$ORIGIN" "$DEST" 2026-04-01 --adults 2 --json)
 OFFER=$(echo "$RESULTS" | jq -r '.offers[0].id')
+TOTAL=$(echo "$RESULTS" | jq '.total_results')
 
-# Unlock + Book
-boostedtravel unlock "$OFFER"
+if [ "$OFFER" = "null" ] || [ -z "$OFFER" ]; then
+  echo "No flights found $ORIGIN → $DEST" >&2
+  exit 1
+fi
+echo "Found $TOTAL offers, best: $OFFER"
+
+# Step 3: Unlock ($1) — with error check
+if ! boostedtravel unlock "$OFFER" --json > /dev/null 2>&1; then
+  echo "Unlock failed — check payment setup (boostedtravel setup-payment)" >&2
+  exit 1
+fi
+
+# Step 4: Book (free after unlock)
 boostedtravel book "$OFFER" \
   --passenger '{"id":"pas_0","given_name":"John","family_name":"Doe","born_on":"1990-01-15","gender":"m","title":"mr"}' \
   --passenger '{"id":"pas_1","given_name":"Jane","family_name":"Doe","born_on":"1992-03-20","gender":"f","title":"ms"}' \
@@ -520,6 +538,39 @@ After unlock, the price is held for 30 minutes. Use this to present options to t
 | Unlock | $1 | Confirms price, holds 30 minutes |
 | Book | FREE | After unlock — real airline PNR |
 
+## Rate Limits and Timeouts
+
+The API has generous limits. Search is completely free and unlimited.
+
+| Endpoint | Rate Limit | Typical Latency | Timeout |
+|----------|-----------|-----------------|----------|
+| Search | 60 req/min per agent | 2-15s (depends on airline APIs) | 30s |
+| Resolve location | 120 req/min per agent | <1s | 5s |
+| Unlock | 20 req/min per agent | 2-5s | 15s |
+| Book | 10 req/min per agent | 3-10s | 30s |
+
+**Rate limit handling:**
+
+```python
+import time
+from boostedtravel import BoostedTravel, BoostedTravelError
+
+def search_with_retry(bt, origin, dest, date, max_retries=3):
+    """Retry with exponential backoff on rate limit or timeout."""
+    for attempt in range(max_retries):
+        try:
+            return bt.search(origin, dest, date)
+        except BoostedTravelError as e:
+            if "rate limit" in str(e).lower() or "429" in str(e):
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                time.sleep(wait)
+            elif "timeout" in str(e).lower() or "504" in str(e):
+                time.sleep(1)  # brief pause then retry
+            else:
+                raise
+    raise BoostedTravelError("Max retries exceeded")
+```
+
 ## Building an Autonomous AI Agent
 
 ### Recommended Architecture
@@ -573,6 +624,90 @@ def find_cheapest_date(bt, origin, dest, dates):
         except BoostedTravelError:
             continue
     return best
+```
+
+### Advanced Preference Evaluation
+
+Instead of always picking the cheapest, score offers by weighted criteria:
+
+```python
+def score_offer(offer, weights=None):
+    """Score a flight (lower = better). Weights sum to 1.0."""
+    w = weights or {"price": 0.4, "duration": 0.3, "stops": 0.2, "airline": 0.1}
+    preferred = {"British Airways", "Delta", "United", "Lufthansa", "KLM"}
+    
+    price_norm = offer.price / 2000
+    dur_norm = (offer.outbound.total_duration_seconds / 3600) / 24
+    stops_norm = offer.outbound.stopovers / 3
+    airline_norm = 0 if any(a in preferred for a in offer.airlines) else 1
+    
+    return (w["price"] * price_norm + w["duration"] * dur_norm +
+            w["stops"] * stops_norm + w["airline"] * airline_norm)
+
+# Usage
+flights = bt.search("LHR", "JFK", "2026-06-01", limit=50)
+best = min(flights.offers, key=lambda o: score_offer(o, {
+    "price": 0.3, "duration": 0.4, "stops": 0.2, "airline": 0.1
+}))
+```
+
+Adjust weights based on user preferences:
+- Business traveler: `{"duration": 0.5, "stops": 0.3, "price": 0.1, "airline": 0.1}`
+- Budget traveler: `{"price": 0.7, "stops": 0.15, "duration": 0.1, "airline": 0.05}`
+- Comfort traveler: `{"stops": 0.4, "duration": 0.3, "airline": 0.2, "price": 0.1}`
+
+### Data Persistence for Price Tracking
+
+For agents that track prices over time or compare across sessions:
+
+```python
+import json
+from datetime import datetime
+from pathlib import Path
+
+CACHE_FILE = Path("flight_price_history.json")
+
+def save_search_result(origin, dest, date, result):
+    """Append search result to price history."""
+    history = json.loads(CACHE_FILE.read_text()) if CACHE_FILE.exists() else {}
+    key = f"{origin}-{dest}-{date}"
+    history.setdefault(key, []).append({
+        "searched_at": datetime.utcnow().isoformat(),
+        "cheapest_price": result.cheapest.price if result.offers else None,
+        "total_offers": result.total_results,
+    })
+    CACHE_FILE.write_text(json.dumps(history, indent=2))
+
+def get_price_trend(origin, dest, date):
+    """Check if prices are rising or falling."""
+    history = json.loads(CACHE_FILE.read_text()) if CACHE_FILE.exists() else {}
+    prices = [e["cheapest_price"] for e in history.get(f"{origin}-{dest}-{date}", []) if e["cheapest_price"]]
+    if len(prices) < 2:
+        return "insufficient_data"
+    return f"{'falling' if prices[-1] < prices[0] else 'rising'} (${prices[0]} → ${prices[-1]})"
+```
+
+### Scheduling Repeated Searches
+
+For autonomous price monitoring agents:
+
+```python
+import time
+
+def monitor_prices(bt, route_configs, interval_minutes=60, max_checks=24):
+    """Periodically search routes and track price trends.
+    
+    route_configs: [{"origin": "LON", "dest": "BCN", "date": "2026-06-01"}, ...]
+    """
+    for check in range(max_checks):
+        for route in route_configs:
+            result = bt.search(route["origin"], route["dest"], route["date"])
+            save_search_result(route["origin"], route["dest"], route["date"], result)
+            trend = get_price_trend(route["origin"], route["dest"], route["date"])
+            if result.offers:
+                print(f"{route['origin']}→{route['dest']} {route['date']}: "
+                      f"${result.cheapest.price} ({trend})")
+        time.sleep(interval_minutes * 60)
 ```
 
 ## Get an API Key

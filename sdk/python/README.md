@@ -26,11 +26,45 @@ bt = BoostedTravel(api_key="trav_...")
 # Option B: Set BOOSTEDTRAVEL_API_KEY env var, then:
 bt = BoostedTravel()
 
-# Setup payment (required before unlock)
-bt.setup_payment(token="tok_visa")  # Stripe payment token
+# Setup payment (required before unlock) — three options:
+
+# Option 1: Stripe test token (for development)
+bt.setup_payment(token="tok_visa")
+
+# Option 2: Stripe PaymentMethod ID (from Stripe.js or Elements)
+bt.setup_payment(payment_method_id="pm_1234567890")
+
+# Option 3: Raw card details (requires PCI-compliant Stripe account)
+bt.setup_payment(card_number="4242424242424242", exp_month=12, exp_year=2027, cvc="123")
 ```
 
 The API key is sent as `X-API-Key` header on every request. The SDK handles this automatically.
+
+### Verify Your Credentials
+
+```python
+# Check that auth + payment are working
+profile = bt.me()
+print(f"Agent: {profile['agent_name']}")
+print(f"Payment: {profile.get('payment_status', 'not set up')}")
+print(f"Searches: {profile.get('search_count', 0)}")
+```
+
+### Auth Failure Recovery
+
+```python
+from boostedtravel import BoostedTravel, AuthenticationError
+
+try:
+    bt = BoostedTravel(api_key="trav_...")
+    flights = bt.search("LHR", "JFK", "2026-04-15")
+except AuthenticationError:
+    # Key invalid or expired — re-register to get a new one
+    creds = BoostedTravel.register("my-agent", "agent@example.com")
+    bt = BoostedTravel(api_key=creds["api_key"])
+    bt.setup_payment(token="tok_visa")  # Re-attach payment on new key
+    flights = bt.search("LHR", "JFK", "2026-04-15")
+```
 
 ## Quick Start (Python)
 
@@ -178,6 +212,43 @@ except BoostedTravelError as e:
 | `PaymentRequiredError` | 402 | No payment method (call `setup_payment()`) |
 | `OfferExpiredError` | 410 | Offer no longer available |
 | `BoostedTravelError` | any | Base class for all API errors |
+
+### Timeout and Retry Pattern
+
+Airline APIs can be slow (2–15s for search). Use retry with backoff for production:
+
+```python
+import time
+from boostedtravel import BoostedTravel, BoostedTravelError
+
+bt = BoostedTravel()
+
+def search_with_retry(origin, dest, date, max_retries=3):
+    """Retry with exponential backoff on rate limit or timeout."""
+    for attempt in range(max_retries):
+        try:
+            return bt.search(origin, dest, date)
+        except BoostedTravelError as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                print(f"Rate limited, waiting {wait}s...")
+                time.sleep(wait)
+            elif "timeout" in str(e).lower() or "504" in str(e):
+                print(f"Timeout, retrying ({attempt + 1}/{max_retries})...")
+                time.sleep(1)
+            else:
+                raise
+    raise BoostedTravelError("Max retries exceeded")
+```
+
+### Rate Limits
+
+| Endpoint | Rate Limit | Typical Latency |
+|----------|-----------|------------------|
+| Search | 60 req/min | 2-15s |
+| Resolve location | 120 req/min | <1s |
+| Unlock | 20 req/min | 2-5s |
+| Book | 10 req/min | 3-10s |
 
 ## Minimizing Unlock Costs
 

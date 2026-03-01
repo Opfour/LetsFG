@@ -240,6 +240,15 @@ BOOSTEDTRAVEL_API_KEY=trav_... boostedtravel-mcp
 | `--sort` | `sort` | price, duration, best_per_airline | price |
 | `--limit` | `limit` | 1–200 | 50 |
 | `--currency` | `currency` | EUR, USD, GBP, etc. | EUR |
+
+### Cabin Class Codes Explained
+
+| Code | Class | Description | Typical Use Case |
+|------|-------|-------------|------------------|
+| `M` | Economy | Standard seating | Budget travel, most bookings |
+| `W` | Premium Economy | Extra legroom, priority boarding | Long-haul comfort without business price |
+| `C` | Business | Lie-flat on long-haul, lounge access | Corporate travel, 6+ hour flights |
+| `F` | First | Private suites, premium dining | Ultra-premium routes (limited airlines) |
 | `--json` | — | Output as JSON | — |
 
 ## Error Handling
@@ -252,6 +261,53 @@ BOOSTEDTRAVEL_API_KEY=trav_... boostedtravel-mcp
 | `ValidationError` | 422 | Invalid request parameters |
 | `RateLimitError` | 429 | Too many requests |
 | `ProviderError` | 502 | Upstream airline/hotel API error |
+
+### Authentication Failure Recovery
+
+```python
+from boostedtravel import BoostedTravel, AuthenticationError
+
+try:
+    bt = BoostedTravel(api_key="trav_...")
+    flights = bt.search("LHR", "JFK", "2026-04-15")
+except AuthenticationError:
+    # API key invalid or expired — re-register
+    creds = BoostedTravel.register("my-agent", "agent@example.com")
+    bt = BoostedTravel(api_key=creds["api_key"])
+    # Don't forget to re-setup payment
+    bt.setup_payment(token="tok_visa")
+```
+
+### Rate Limit and Timeout Handling
+
+```python
+import time
+from boostedtravel import BoostedTravel, BoostedTravelError
+
+def search_with_retry(bt, origin, dest, date, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return bt.search(origin, dest, date)
+        except BoostedTravelError as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                time.sleep(2 ** attempt)  # exponential backoff
+            elif "timeout" in str(e).lower() or "504" in str(e):
+                time.sleep(1)
+            else:
+                raise
+    raise BoostedTravelError("Max retries exceeded")
+```
+
+## Rate Limits
+
+| Endpoint | Rate Limit | Typical Latency |
+|----------|-----------|------------------|
+| Search flights | 60 req/min | 2-15s |
+| Resolve location | 120 req/min | <1s |
+| Unlock | 20 req/min | 2-5s |
+| Book | 10 req/min | 3-10s |
+| Search hotels | 30 req/min | 3-10s |
+| Register | 5 req/min | <1s |
 
 ## Pricing Summary
 

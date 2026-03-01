@@ -168,7 +168,7 @@ All commands accept `--json` for structured output and `--api-key` to override t
 | `--return` | `-r` | _(one-way)_ | Return date for round-trip (YYYY-MM-DD) |
 | `--adults` | `-a` | `1` | Number of adult passengers (1–9) |
 | `--children` | | `0` | Number of children (2–11 years) |
-| `--cabin` | `-c` | _(any)_ | Cabin class: `M` economy, `W` premium, `C` business, `F` first |
+| `--cabin` | `-c` | _(any)_ | Cabin class (see below) |
 | `--max-stops` | `-s` | `2` | Maximum stopovers per direction (0–4) |
 | `--currency` | | `EUR` | 3-letter currency code |
 | `--limit` | `-l` | `20` | Maximum number of results (1–100) |
@@ -189,6 +189,17 @@ boostedtravel search LAX NRT 2026-08-10 --return 2026-08-24 --cabin F --sort dur
 ```
 
 When you search with multiple passengers, the response includes `passenger_ids` (e.g., `["pas_0", "pas_1", "pas_2"]`). You must provide passenger details for **each** ID when booking.
+
+### Cabin Class Codes Explained
+
+| Code | Class | Typical Use Case |
+|------|-------|-----------------|
+| `M` | Economy | Standard seating, cheapest fares |
+| `W` | Premium Economy | Extra legroom, better meals, priority boarding |
+| `C` | Business | Lie-flat seats on long-haul, lounge access, flexible tickets |
+| `F` | First | Top-tier service, suites on some airlines, maximum comfort |
+
+If omitted, the search returns all cabin classes. Specify a cabin code to filter results to that class only.
 
 ## Authentication
 
@@ -246,13 +257,70 @@ bt = BoostedTravel(api_key=creds["api_key"])
 
 ### 4. Setup Payment (required before unlock)
 
+You must attach a payment method before you can unlock offers or book flights. This is a one-time step.
+
 ```bash
+# CLI — opens Stripe to attach a card
 boostedtravel setup-payment
-# Opens Stripe to attach a payment method to your agent account
 ```
 
 ```python
-bt.setup_payment(token="tok_visa")  # Stripe payment token
+# Python SDK — multiple options:
+
+# Option A: Stripe test token (for development)
+bt.setup_payment(token="tok_visa")
+
+# Option B: Stripe PaymentMethod ID (from Stripe.js or Elements)
+bt.setup_payment(payment_method_id="pm_xxx")
+
+# Option C: Raw card details (requires PCI-compliant Stripe account)
+bt.setup_payment(card_number="4242424242424242", exp_month=12, exp_year=2027, cvc="123")
+```
+
+```bash
+# cURL
+curl -X POST https://api.boostedchat.com/api/v1/agents/setup-payment \
+  -H "X-API-Key: trav_..." \
+  -H "Content-Type: application/json" \
+  -d '{"token": "tok_visa"}'
+```
+
+After setup, all charges ($1 unlock) are automatic — no further payment interaction needed.
+
+### 5. Verify Authentication Works
+
+```python
+# Check your agent profile — confirms key and payment status
+profile = bt.get_profile()
+print(f"Agent: {profile['agent_name']}")
+print(f"Payment: {profile['payment_status']}")
+print(f"Searches: {profile['search_count']}")
+print(f"Bookings: {profile['booking_count']}")
+```
+
+```bash
+boostedtravel me
+# Agent: my-agent
+# Payment: active
+# Searches: 42
+# Bookings: 3
+```
+
+### Authentication Failure Handling
+
+```python
+from boostedtravel import BoostedTravel, AuthenticationError
+
+try:
+    bt = BoostedTravel(api_key="trav_invalid_key")
+    flights = bt.search("LHR", "JFK", "2026-04-15")
+except AuthenticationError:
+    # HTTP 401 — key is missing, invalid, or expired
+    print("Invalid API key. Register a new one:")
+    creds = BoostedTravel.register("my-agent", "agent@example.com")
+    bt = BoostedTravel(api_key=creds["api_key"])
+    # Don't forget to set up payment after re-registering
+    bt.setup_payment(token="tok_visa")
 ```
 
 ## Error Handling
@@ -424,6 +492,30 @@ boostedtravel locations "New York"
 #   NYC  New York (all airports)
 ```
 
+### Handling Ambiguous Locations
+
+When a city has multiple airports, you have two strategies:
+
+```python
+locations = bt.resolve_location("London")
+# Returns: LHR, LGW, STN, LTN, LCY, LON
+
+# Strategy 1: Use the CITY code (searches ALL airports in that city)
+flights = bt.search("LON", "BCN", "2026-04-01")  # all London airports
+
+# Strategy 2: Use a specific AIRPORT code (only that airport)
+flights = bt.search("LHR", "BCN", "2026-04-01")  # Heathrow only
+
+# Strategy 3: Search multiple airports and compare (free!)
+for loc in locations:
+    if loc["type"] == "airport":
+        result = bt.search(loc["iata_code"], "BCN", "2026-04-01")
+        if result.offers:
+            print(f"{loc['name']} ({loc['iata_code']}): cheapest {result.cheapest.price} {result.cheapest.currency}")
+```
+
+**Rule of thumb:** Use the city code (3-letter, e.g. `LON`, `NYC`, `PAR`) when you want the broadest search across all airports. Use a specific airport code when the user has a preference.
+
 ## Complete Search-to-Booking Workflow
 
 Here's a complete, production-ready workflow with proper error handling at each step:
@@ -508,20 +600,35 @@ search_and_book(
 
 ```bash
 #!/bin/bash
+set -euo pipefail
 export BOOSTEDTRAVEL_API_KEY=trav_...
 
 # Step 1: Resolve locations
 ORIGIN=$(boostedtravel locations "London" --json | jq -r '.[0].iata_code')
 DEST=$(boostedtravel locations "Barcelona" --json | jq -r '.[0].iata_code')
 
+if [ -z "$ORIGIN" ] || [ -z "$DEST" ]; then
+  echo "Error: Could not resolve locations" >&2
+  exit 1
+fi
+
 # Step 2: Search
 RESULTS=$(boostedtravel search "$ORIGIN" "$DEST" 2026-04-01 --adults 2 --json)
 OFFER_ID=$(echo "$RESULTS" | jq -r '.offers[0].id')
-PAX_IDS=$(echo "$RESULTS" | jq -r '.passenger_ids[]')
-echo "Best offer: $OFFER_ID"
+TOTAL=$(echo "$RESULTS" | jq '.total_results')
+
+if [ "$OFFER_ID" = "null" ] || [ -z "$OFFER_ID" ]; then
+  echo "No flights found $ORIGIN → $DEST" >&2
+  exit 1
+fi
+
+echo "Found $TOTAL offers, best: $OFFER_ID"
 
 # Step 3: Unlock
-boostedtravel unlock "$OFFER_ID"
+if ! boostedtravel unlock "$OFFER_ID" --json > /dev/null 2>&1; then
+  echo "Unlock failed — check payment setup" >&2
+  exit 1
+fi
 
 # Step 4: Book (one --passenger per passenger_id)
 boostedtravel book "$OFFER_ID" \
@@ -664,6 +771,125 @@ def find_cheapest_date(bt, origin, dest, dates):
         except BoostedTravelError:
             continue  # Skip dates with no routes
     return best  # (date, offer, passenger_ids) or None
+```
+
+### Rate Limits and Timeouts
+
+The API has generous rate limits. Search is unlimited and free, so you can make many requests without cost. For production agents:
+
+| Endpoint | Rate Limit | Timeout |
+|----------|-----------|---------|
+| Search | 60 req/min per agent | 30s (airline APIs can be slow) |
+| Resolve location | 120 req/min per agent | 5s |
+| Unlock | 20 req/min per agent | 15s |
+| Book | 10 req/min per agent | 30s |
+
+Handle rate limits and timeouts in production:
+
+```python
+import time
+from boostedtravel import BoostedTravel, BoostedTravelError
+
+bt = BoostedTravel()
+
+def search_with_retry(origin, dest, date, max_retries=3):
+    """Retry with exponential backoff on rate limit or timeout."""
+    for attempt in range(max_retries):
+        try:
+            return bt.search(origin, dest, date)
+        except BoostedTravelError as e:
+            if "rate limit" in str(e).lower() or "429" in str(e):
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                print(f"Rate limited, waiting {wait}s...")
+                time.sleep(wait)
+            elif "timeout" in str(e).lower() or "504" in str(e):
+                print(f"Timeout, retrying ({attempt + 1}/{max_retries})...")
+                time.sleep(1)
+            else:
+                raise
+    raise BoostedTravelError("Max retries exceeded")
+```
+
+### Advanced Preference Evaluation
+
+Rather than always picking the cheapest flight, score offers by weighted criteria:
+
+```python
+def score_offer(offer, preferences=None):
+    """Score a flight offer by multiple criteria (lower = better).
+    
+    preferences: dict with weights, e.g.:
+        {"price": 0.4, "duration": 0.3, "stops": 0.2, "airline_pref": 0.1}
+    """
+    prefs = preferences or {"price": 0.4, "duration": 0.3, "stops": 0.2, "airline_pref": 0.1}
+    preferred_airlines = {"British Airways", "Delta", "United", "Lufthansa"}
+    
+    # Normalize factors (0-1 scale, lower is better)
+    price_score = offer.price / 2000        # Normalize against $2000 baseline
+    duration_hours = offer.outbound.total_duration_seconds / 3600
+    duration_score = duration_hours / 24    # Normalize against 24h baseline
+    stops_score = offer.outbound.stopovers / 3  # Normalize against 3 stops
+    airline_score = 0 if any(a in preferred_airlines for a in offer.airlines) else 1
+    
+    return (
+        prefs["price"] * price_score +
+        prefs["duration"] * duration_score +
+        prefs["stops"] * stops_score +
+        prefs["airline_pref"] * airline_score
+    )
+
+# Usage: find best offer considering multiple criteria
+flights = bt.search("LHR", "JFK", "2026-06-01", limit=50)
+best = min(flights.offers, key=lambda o: score_offer(o, {
+    "price": 0.3,      # Price matters, but not everything
+    "duration": 0.4,    # Shortest travel time is priority
+    "stops": 0.2,       # Prefer direct flights
+    "airline_pref": 0.1 # Slight preference for known airlines
+}))
+print(f"Best overall: {best.airlines[0]} ${best.price} — {best.outbound.stopovers} stops")
+```
+
+### Data Persistence for Price Aggregation
+
+For agents that track prices over time or compare across sessions:
+
+```python
+import json
+from datetime import datetime
+from pathlib import Path
+
+CACHE_FILE = Path("flight_price_history.json")
+
+def load_price_history():
+    if CACHE_FILE.exists():
+        return json.loads(CACHE_FILE.read_text())
+    return {}
+
+def save_search_result(origin, dest, date, result):
+    """Save search results for later comparison."""
+    history = load_price_history()
+    key = f"{origin}-{dest}-{date}"
+    if key not in history:
+        history[key] = []
+    history[key].append({
+        "searched_at": datetime.utcnow().isoformat(),
+        "cheapest_price": result.cheapest.price if result.offers else None,
+        "total_offers": result.total_results,
+        "airlines": list(set(a for o in result.offers[:5] for a in o.airlines)),
+    })
+    CACHE_FILE.write_text(json.dumps(history, indent=2))
+
+def get_price_trend(origin, dest, date):
+    """Check if prices are rising or falling for a route."""
+    history = load_price_history()
+    key = f"{origin}-{dest}-{date}"
+    entries = history.get(key, [])
+    if len(entries) < 2:
+        return "insufficient_data"
+    prices = [e["cheapest_price"] for e in entries if e["cheapest_price"]]
+    if prices[-1] < prices[0]:
+        return f"falling (${prices[0]} → ${prices[-1]})"
+    return f"rising (${prices[0]} → ${prices[-1]})"
 ```
 
 ## Packages
