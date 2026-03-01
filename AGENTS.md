@@ -32,13 +32,59 @@ Search 400+ airlines across multiple providers. Returns real-time prices with ze
 
 ### 2. Unlock ($1.00)
 ```
-POST /api/v1/flights/unlock
+POST /api/v1/bookings/unlock
 ```
 Confirm the live price and lock it for booking. Costs $1.00 via Stripe. This is the only charge.
 
+**What happens when you unlock:**
+1. BoostedTravel sends `offer_id` to the airline's NDC/GDS system
+2. Airline confirms **current live price** (may differ from search)
+3. $1.00 charged via Stripe to your saved payment method
+4. Offer **reserved for 30 minutes** — you must book within this window
+5. Returns `confirmed_price`, `confirmed_currency`, `offer_expires_at`
+
+**Requirements:** Payment method must be set up first (`boostedtravel setup-payment` or `bt.setup_payment()`). Without payment, unlock returns HTTP 402 (`PaymentRequiredError`).
+
+**Key unlock details:**
+- Input: `offer_id` (from search results) — this is the only required parameter
+- HTTP 402 → no payment method attached
+- HTTP 410 → offer expired (airline sold the seats) — search again
+- The `confirmed_price` may differ from search price (airline prices change in real-time)
+- If 30-minute window expires without booking, the $1 is not refunded
+
+```python
+from boostedtravel import BoostedTravel, PaymentRequiredError, OfferExpiredError
+
+bt = BoostedTravel()  # reads BOOSTEDTRAVEL_API_KEY
+
+flights = bt.search("LHR", "JFK", "2026-06-01")
+
+try:
+    unlocked = bt.unlock(flights.cheapest.id)
+    print(f"Confirmed: {unlocked.confirmed_price} {unlocked.confirmed_currency}")
+    print(f"Expires: {unlocked.offer_expires_at}")
+except PaymentRequiredError:
+    print("Run: boostedtravel setup-payment")
+except OfferExpiredError:
+    print("Offer expired — search again")
+```
+
+```bash
+# CLI
+boostedtravel unlock off_xxx
+# Output: Confirmed price: EUR 189.50, Expires: 2026-06-01T15:30:00Z
+
+# cURL
+curl -X POST https://api.boostedchat.com/api/v1/bookings/unlock \
+  -H "X-API-Key: trav_..." \
+  -H "Content-Type: application/json" \
+  -d '{"offer_id": "off_xxx"}'
+# Response: {"offer_id":"off_xxx","confirmed_price":189.50,"confirmed_currency":"EUR","offer_expires_at":"..."}
+```
+
 ### 3. Book (FREE after unlock)
 ```
-POST /api/v1/flights/book
+POST /api/v1/bookings/book
 ```
 Book the flight with real passenger details. **No additional charges** — booking is free after the $1 unlock.
 
@@ -131,7 +177,7 @@ Same CLI commands available, plus SDK usage:
 import { BoostedTravel } from 'boostedtravel';
 
 const bt = new BoostedTravel({ apiKey: 'trav_...' });
-const flights = await bt.searchFlights({ origin: 'LHR', destination: 'JFK', dateFrom: '2026-04-15' });
+const flights = await bt.search('LHR', 'JFK', '2026-04-15');
 console.log(`${flights.totalResults} offers`);
 ```
 
@@ -331,6 +377,8 @@ The SDK raises specific exceptions for each failure mode:
 ```python
 from boostedtravel import BoostedTravel, BoostedTravelError
 
+bt = BoostedTravel()  # reads BOOSTEDTRAVEL_API_KEY
+
 try:
     flights = bt.search("INVALID", "JFK", "2026-04-15")
 except BoostedTravelError as e:
@@ -361,6 +409,8 @@ from boostedtravel import (
     BoostedTravel, BoostedTravelError,
     AuthenticationError, PaymentRequiredError, OfferExpiredError,
 )
+
+bt = BoostedTravel()  # reads BOOSTEDTRAVEL_API_KEY
 
 try:
     flights = bt.search("LHR", "JFK", "2026-04-15")
@@ -593,6 +643,11 @@ User request → Parse intent → Resolve locations → Search (free)
 ### Retry Logic for Expired Offers
 
 ```python
+from boostedtravel import (
+    BoostedTravel, BoostedTravelError,
+    PaymentRequiredError, OfferExpiredError,
+)
+
 def resilient_book(bt, origin, dest, date, passengers, email, max_retries=2):
     for attempt in range(max_retries + 1):
         flights = bt.search(origin, dest, date, adults=len(passengers))
@@ -708,6 +763,139 @@ def monitor_prices(bt, route_configs, interval_minutes=60, max_checks=24):
                 print(f"{route['origin']}→{route['dest']} {route['date']}: "
                       f"${result.cheapest.price} ({trend})")
         time.sleep(interval_minutes * 60)
+```
+
+### Complete Autonomous Agent Example
+
+End-to-end implementation of an AI agent that autonomously searches, evaluates, and books flights based on user preferences while managing costs and edge cases:
+
+```python
+from boostedtravel import (
+    BoostedTravel, BoostedTravelError,
+    AuthenticationError, PaymentRequiredError, OfferExpiredError,
+)
+import time
+
+class FlightAgent:
+    """Autonomous flight booking agent with preference evaluation and cost management."""
+    
+    def __init__(self, api_key=None):
+        self.bt = BoostedTravel(api_key=api_key)
+    
+    def resolve_city(self, city_name):
+        """Resolve city name to IATA code, handling ambiguity."""
+        locations = self.bt.resolve_location(city_name)
+        if not locations:
+            raise ValueError(f"Unknown city: {city_name}")
+        # Prefer city code (covers all airports) over single airport
+        for loc in locations:
+            if loc.get("type") == "city":
+                return loc["iata_code"]
+        return locations[0]["iata_code"]
+    
+    def evaluate_offers(self, offers, preferences):
+        """Score and rank offers by user preferences. Lower score = better.
+        
+        preferences: {"price": 0.4, "duration": 0.3, "stops": 0.2, "airline": 0.1}
+        """
+        preferred_airlines = preferences.get("preferred_airlines", set())
+        weights = {
+            "price": preferences.get("price", 0.4),
+            "duration": preferences.get("duration", 0.3),
+            "stops": preferences.get("stops", 0.2),
+            "airline": preferences.get("airline", 0.1),
+        }
+        
+        scored = []
+        for offer in offers:
+            price_norm = offer.price / 2000
+            dur_norm = (offer.outbound.total_duration_seconds / 3600) / 24
+            stops_norm = offer.outbound.stopovers / 3
+            airline_norm = 0 if any(a in preferred_airlines for a in offer.airlines) else 1
+            
+            score = (weights["price"] * price_norm + weights["duration"] * dur_norm +
+                     weights["stops"] * stops_norm + weights["airline"] * airline_norm)
+            scored.append((score, offer))
+        
+        return sorted(scored, key=lambda x: x[0])
+    
+    def search_and_book(self, origin_city, dest_city, date, passengers, email,
+                        preferences=None, max_retries=2):
+        """Full autonomous workflow: resolve → search → evaluate → unlock → book.
+        
+        Returns booking result or None if no suitable flights found.
+        """
+        # Step 1: Resolve locations (free)
+        origin = self.resolve_city(origin_city)
+        dest = self.resolve_city(dest_city)
+        
+        for attempt in range(max_retries + 1):
+            # Step 2: Search (free, unlimited)
+            flights = self.bt.search(origin, dest, date, adults=len(passengers))
+            if not flights.offers:
+                return None
+            
+            # Step 3: Evaluate by preferences (not just cheapest)
+            if preferences:
+                ranked = self.evaluate_offers(flights.offers, preferences)
+                best_offer = ranked[0][1]  # highest-scored offer
+            else:
+                best_offer = flights.cheapest
+            
+            # Step 4: Unlock ($1) — confirms live price with airline
+            try:
+                unlocked = self.bt.unlock(best_offer.id)
+                
+                # Check if confirmed price differs significantly from search
+                price_diff = abs(unlocked.confirmed_price - best_offer.price)
+                if price_diff > best_offer.price * 0.1:  # >10% price change
+                    print(f"Warning: Price changed from {best_offer.price} to {unlocked.confirmed_price}")
+                
+            except OfferExpiredError:
+                if attempt < max_retries:
+                    time.sleep(1)
+                    continue  # Search again for fresh offers
+                raise
+            except PaymentRequiredError:
+                raise  # Can't retry — need payment setup
+            
+            # Step 5: Book (free after unlock) — map passenger IDs
+            try:
+                mapped_passengers = [
+                    {**p, "id": pid}
+                    for p, pid in zip(passengers, flights.passenger_ids)
+                ]
+                booking = self.bt.book(
+                    offer_id=unlocked.offer_id,
+                    passengers=mapped_passengers,
+                    contact_email=email,
+                )
+                return booking
+            except OfferExpiredError:
+                if attempt < max_retries:
+                    continue  # 30-min window expired, retry full flow
+                raise
+
+# Usage
+agent = FlightAgent()
+
+booking = agent.search_and_book(
+    origin_city="London",
+    dest_city="New York",
+    date="2026-06-15",
+    passengers=[
+        {"given_name": "John", "family_name": "Doe", "born_on": "1990-01-15",
+         "gender": "m", "title": "mr"},
+    ],
+    email="john@example.com",
+    preferences={
+        "price": 0.3, "duration": 0.4, "stops": 0.2, "airline": 0.1,
+        "preferred_airlines": {"British Airways", "Delta"},
+    },
+)
+
+if booking:
+    print(f"Booked! PNR: {booking.booking_reference}")
 ```
 
 ## Get an API Key

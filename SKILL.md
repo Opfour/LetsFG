@@ -51,10 +51,18 @@ Resolve city names to IATA airport/city codes.
 - **Output:** List of matching IATA codes (e.g. LON, LHR, LGW, STN, LTN, LCY)
 
 ### unlock_flight_offer
-Confirm live price with airline and reserve offer for 30 minutes.
-- **Cost:** $1.00 (Stripe)
-- **Input:** offer_id from search results
-- **Output:** confirmed_price, confirmed_currency, offer_expires_at
+Confirm live price with airline and reserve offer for 30 minutes. This is the only paid step.
+- **Cost:** $1.00 (Stripe) — charged to saved payment method
+- **Endpoint:** `POST /api/v1/bookings/unlock`
+- **Input:** offer_id from search results (only required parameter)
+- **Output:** confirmed_price, confirmed_currency, offer_expires_at, payment_status, charge_amount
+- **Prerequisite:** Payment method must be attached via `setup_payment` first
+- **HTTP 402:** No payment method — call setup_payment first (PaymentRequiredError)
+- **HTTP 410:** Offer expired — airline sold the seats, search again (OfferExpiredError)
+- **Note:** confirmed_price may differ from search price (airline prices change in real-time). After unlock, you have 30 minutes to call book. If the window expires, search again (free) and unlock again ($1).
+- **Python:** `unlocked = bt.unlock(offer_id)` → returns UnlockResult
+- **CLI:** `boostedtravel unlock off_xxx`
+- **JS/TS:** `const unlocked = await bt.unlock(offerId)`
 
 ### book_flight
 Create a real airline reservation with PNR code. FREE after unlock.
@@ -173,16 +181,16 @@ from boostedtravel import BoostedTravel
 bt = BoostedTravel(api_key="trav_...")
 
 # Search
-results = bt.search_flights(origin="LHR", destination="JFK", date_from="2026-04-15")
+results = bt.search("LHR", "JFK", "2026-04-15")
 for offer in results.offers:
     print(f"{offer.price} {offer.currency} — {', '.join(offer.airlines)}")
 
 # Unlock
-unlocked = bt.unlock_offer(offer_id=results.offers[0].id)
+unlocked = bt.unlock(results.offers[0].id)
 print(f"Confirmed: {unlocked.confirmed_price} {unlocked.confirmed_currency}")
 
 # Book
-booking = bt.book_flight(
+booking = bt.book(
     offer_id=results.offers[0].id,
     passengers=[{
         "id": results.passenger_ids[0],
@@ -239,11 +247,11 @@ BOOSTEDTRAVEL_API_KEY=trav_... boostedtravel-mcp
 | `--adults` | `adults` | 1–9 | 1 |
 | `--children` | `children` | 0–9 | 0 |
 | `--infants` | `infants` | 0–9 | 0 |
-| `--cabin` | `cabin_class` | M (economy), W (premium), C (business), F (first) | M |
+| `--cabin` | `cabin_class` | M (economy), W (premium), C (business), F (first) | _(any)_ |
 | `--return` | `return_from` | YYYY-MM-DD | — |
 | `--max-stops` | `max_stopovers` | 0–4 | 2 |
-| `--sort` | `sort` | price, duration, best_per_airline | price |
-| `--limit` | `limit` | 1–200 | 50 |
+| `--sort` | `sort` | price, duration | price |
+| `--limit` | `limit` | 1–100 | 20 |
 | `--currency` | `currency` | EUR, USD, GBP, etc. | EUR |
 
 ### Cabin Class Codes Explained
@@ -261,11 +269,11 @@ BOOSTEDTRAVEL_API_KEY=trav_... boostedtravel-mcp
 | Exception | HTTP Code | When |
 |-----------|-----------|------|
 | `AuthenticationError` | 401 | Invalid or missing API key |
-| `PaymentRequired` | 402 | No payment method attached |
-| `OfferExpired` | 410 | Offer no longer available |
-| `ValidationError` | 422 | Invalid request parameters |
-| `RateLimitError` | 429 | Too many requests |
-| `ProviderError` | 502 | Upstream airline/hotel API error |
+| `PaymentRequiredError` | 402 | No payment method attached |
+| `OfferExpiredError` | 410 | Offer no longer available |
+| `BoostedTravelError` | 422 | Invalid request parameters |
+| `BoostedTravelError` | 429 | Too many requests (retry with backoff) |
+| `BoostedTravelError` | 502 | Upstream airline/hotel API error |
 
 ### Authentication Failure Recovery
 

@@ -119,7 +119,7 @@ print(f"Booked! PNR: {booking.booking_reference}")
 import { BoostedTravel } from 'boostedtravel';
 
 const bt = new BoostedTravel({ apiKey: 'trav_...' });
-const flights = await bt.searchFlights({ origin: 'LHR', destination: 'JFK', dateFrom: '2026-04-15' });
+const flights = await bt.search('LHR', 'JFK', '2026-04-15');
 console.log(`${flights.totalResults} offers`);
 ```
 
@@ -291,11 +291,11 @@ After setup, all charges ($1 unlock) are automatic — no further payment intera
 
 ```python
 # Check your agent profile — confirms key and payment status
-profile = bt.get_profile()
-print(f"Agent: {profile['agent_name']}")
-print(f"Payment: {profile['payment_status']}")
-print(f"Searches: {profile['search_count']}")
-print(f"Bookings: {profile['booking_count']}")
+profile = bt.me()
+print(f"Agent: {profile.agent_name}")
+print(f"Payment: {profile.payment_status}")
+print(f"Searches: {profile.search_count}")
+print(f"Bookings: {profile.booking_count}")
 ```
 
 ```bash
@@ -707,6 +707,88 @@ booking = bt.book(offer_id=unlocked.offer_id, passengers=[...], contact_email=".
 | Book | FREE | After unlock — creates real airline PNR |
 | Re-search same route | FREE | Prices may change (real-time airline data) |
 
+## How Unlock Works
+
+Unlocking is the only paid step ($1). It serves as proof of booking intent and confirms the live price with the airline.
+
+### Endpoint
+
+```
+POST /api/v1/bookings/unlock
+```
+
+### What Happens When You Unlock
+
+1. BoostedTravel sends the `offer_id` to the airline's NDC/GDS system
+2. The airline confirms the **current live price** (may differ slightly from search)
+3. A $1.00 charge is made via Stripe to your saved payment method
+4. The offer is **reserved for 30 minutes** — no one else can book it
+5. You receive `confirmed_price`, `confirmed_currency`, and `offer_expires_at`
+
+### Python Example
+
+```python
+from boostedtravel import BoostedTravel, PaymentRequiredError, OfferExpiredError
+
+bt = BoostedTravel()  # reads BOOSTEDTRAVEL_API_KEY
+
+# Search first (free)
+flights = bt.search("LHR", "JFK", "2026-06-01")
+print(f"Search price: {flights.cheapest.price} {flights.cheapest.currency}")
+
+# Unlock ($1) — confirms live price
+try:
+    unlocked = bt.unlock(flights.cheapest.id)
+    print(f"Confirmed price: {unlocked.confirmed_price} {unlocked.confirmed_currency}")
+    print(f"Expires at: {unlocked.offer_expires_at}")
+    # Price may differ from search — airline prices change in real-time
+except PaymentRequiredError:
+    print("No payment method — run: boostedtravel setup-payment")
+except OfferExpiredError:
+    print("Offer no longer available — search again for fresh results")
+```
+
+### CLI Example
+
+```bash
+# Unlock an offer
+boostedtravel unlock off_xxx
+
+# Output:
+# Confirmed price: EUR 189.50
+# Expires at: 2026-06-01T15:30:00Z (30 minutes)
+# Offer ID: off_xxx — ready to book
+```
+
+### cURL Example
+
+```bash
+curl -X POST https://api.boostedchat.com/api/v1/bookings/unlock \
+  -H "X-API-Key: trav_..." \
+  -H "Content-Type: application/json" \
+  -d '{"offer_id": "off_xxx"}'
+
+# Response:
+# {
+#   "offer_id": "off_xxx",
+#   "confirmed_price": 189.50,
+#   "confirmed_currency": "EUR",
+#   "offer_expires_at": "2026-06-01T15:30:00Z",
+#   "payment_status": "charged",
+#   "charge_amount": 1.00,
+#   "charge_currency": "USD"
+# }
+```
+
+### Important Notes
+
+- **Payment method required.** You must call `setup-payment` before your first unlock. If payment is not set up, unlock returns HTTP 402 (`PaymentRequiredError`).
+- **$1 per unlock.** Each unlock costs $1 regardless of flight price. This is the only fee.
+- **30-minute window.** After unlock, you have 30 minutes to call `book`. If the window expires, you must search again (free) and unlock again ($1).
+- **Price confirmation.** The `confirmed_price` may differ from the search price because airline prices change in real-time. Always check `confirmed_price` before booking.
+- **Offer expired (HTTP 410).** If the airline has already sold the seats, unlock returns `OfferExpiredError`. Search again for fresh offers.
+- **No refund on expired unlock.** If you unlock but don't book within 30 minutes, the $1 is not refunded. Plan your workflow to book promptly after unlock.
+
 ## Building an AI Agent with BoostedTravel
 
 Guidelines for building autonomous AI agents that search, evaluate, and book flights:
@@ -735,6 +817,11 @@ User request → Agent parses intent → Resolve locations → Search (free)
 ### Handling Edge Cases
 
 ```python
+from boostedtravel import (
+    BoostedTravel, BoostedTravelError,
+    PaymentRequiredError, OfferExpiredError,
+)
+
 # Retry on expired offers
 def resilient_book(bt, origin, dest, date, passengers, email, max_retries=2):
     for attempt in range(max_retries + 1):

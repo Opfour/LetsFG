@@ -121,9 +121,9 @@ npm publish
 |--------|------|-------------|
 | `POST` | `/api/v1/agents/register` | Register for an API key |
 | `POST` | `/api/v1/flights/search` | Search flights |
-| `POST` | `/api/v1/flights/unlock` | Unlock an offer ($1) |
-| `POST` | `/api/v1/flights/book` | Book a flight (free) |
-| `GET`  | `/api/v1/flights/booking/{id}` | Get booking details |
+| `POST` | `/api/v1/bookings/unlock` | Unlock an offer ($1) |
+| `POST` | `/api/v1/bookings/book` | Book a flight (free) |
+| `GET`  | `/api/v1/bookings/booking/{id}` | Get booking details |
 | `GET`  | `/.well-known/ai-plugin.json` | Agent discovery |
 | `GET`  | `/.well-known/agent.json` | Agent manifest |
 | `GET`  | `/llms.txt` | LLM instructions |
