@@ -1,23 +1,27 @@
 """
-T'way Air scraper — nodriver + AJAX lowest-fare API.
+T'way Air scraper — 3-tier hybrid: curl_cffi + nodriver + CDP Chrome.
 
 T'way Air (IATA: TW) is a South Korean LCC operating domestic (GMP/ICN↔CJU/PUS)
 and international flights to Japan, Taiwan, Vietnam, Thailand, Philippines, Guam.
 
 Website: www.twayair.com — Java/Spring MVC + jQuery, protected by Akamai Bot Manager.
-Uses nodriver (undetected-chromedriver) as primary Akamai bypass, with CDP Chrome
-fallback for when persistent profile has warm Akamai cookies.
 
-Strategy (discovered & verified Mar 2026):
-1. Launch nodriver browser → navigates to www.twayair.com/app/main
-   → Akamai may block first load; retry navigates again after delay
-   → Session cookies: _abck, bm_*, ak_bmsc granted after challenge
-2. Extract CSRF token from <meta name="_csrf"> and header name from <meta name="_csrf_header">
-3. POST /ajax/booking/getLowestFare via synchronous XHR in page context
-   → Parameters: tripType=OW, bookingType=INT/DOM, currency, depAirport, arrAirport
-   → CSRF sent via header (name from _csrf_header meta tag)
-   → Returns JSON: {"routeSaleYnMap": {...}, "OW": {"YYYYMMDD": "pipe|delimited|fare"}}
-4. Parse OW dict values (pipe-delimited) → FlightOffer objects
+Strategy (3-tier hybrid, discovered & verified Mar 2026):
+  Tier 1 — curl_cffi fast path (~0.5-1s):
+    Reuses Akamai cookies + CSRF token cached from a prior browser session.
+    POST /ajax/booking/getLowestFare with impersonate="chrome131".
+    Skipped on first call (no cookies yet) or when cookies are stale (>5 min).
+  Tier 2 — nodriver primary (~3-8s):
+    Launch nodriver (undetected-chromedriver) → navigate to www.twayair.com/app/main
+    → Akamai challenge resolves → extract CSRF token → XHR to getLowestFare.
+    After success, cookies + CSRF are cached for Tier 1 reuse.
+  Tier 3 — CDP Chrome fallback (~5-15s):
+    Persistent Chrome profile on debug port 9451 with warm Akamai cookies.
+    Same AJAX flow as Tier 2. Cookies cached on success.
+
+Cookie refresh: On first call nodriver generates cookies; subsequent calls
+reuse them via curl_cffi. If curl_cffi gets 403, falls through to nodriver
+which naturally refreshes the cache.
 
 Fare data format (pipe-delimited string per date key in OW dict):
   Field 0: Date (YYYYMMDD)
@@ -46,6 +50,12 @@ import time
 from datetime import datetime
 from typing import Any, Optional
 
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CURL = True
+except ImportError:
+    HAS_CURL = False
+
 from models.flights import (
     FlightOffer,
     FlightRoute,
@@ -57,6 +67,8 @@ from models.flights import (
 logger = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS = 2
+_IMPERSONATE = "chrome131"
+_COOKIE_MAX_AGE = 5 * 60  # Reuse Akamai cookies for up to 5 minutes
 
 # Domestic routes (within South Korea) use bookingType=DOM, currency=KRW
 _DOMESTIC_AIRPORTS = {"GMP", "ICN", "CJU", "PUS", "TAE", "KWJ", "RSU", "USN", "MWX", "HIN", "WJU", "YNY", "KPO", "KUV"}
@@ -67,6 +79,12 @@ _COUNTRY_CURRENCY = {
     "TH": "THB", "PH": "PHP", "SG": "SGD", "GU": "USD",
     "HK": "HKD", "MO": "MOP", "CN": "CNY",
 }
+
+# ── curl_cffi cookie cache (populated by nodriver / CDP sessions) ─────────
+_tw_cookies: dict | None = None
+_tw_cookies_ts: float = 0
+_tw_csrf_token: str = ""
+_tw_csrf_header: str = "X-CSRF-TOKEN"
 
 # nodriver browser singleton
 _nd_browser = None
@@ -254,7 +272,7 @@ async def _get_cdp_page(timeout_ms: int):
 
 
 class TwayAirConnectorClient:
-    """T'way Air scraper — nodriver primary, CDP Chrome fallback, AJAX fare API."""
+    """T'way Air 3-tier hybrid: curl_cffi fast path → nodriver → CDP Chrome."""
 
     def __init__(self, timeout: float = 45.0):
         self.timeout = timeout
@@ -278,14 +296,147 @@ class TwayAirConnectorClient:
         return self._empty(req)
 
     async def _attempt_search(self, req: FlightSearchRequest, t0: float) -> Optional[list[FlightOffer]]:
-        # Strategy 1: nodriver (best Akamai bypass)
+        # Strategy 1: curl_cffi fast path (reuse cached Akamai cookies)
+        result = await self._search_via_api(req)
+        if result is not None:
+            logger.info("TwayAir: curl_cffi fast path succeeded")
+            return result
+
+        # Strategy 2: nodriver (best Akamai bypass)
+        logger.info("TwayAir: trying nodriver (tier 2)")
         result = await self._attempt_nodriver(req)
         if result is not None:
             return result
 
-        # Strategy 2: CDP Chrome with persistent profile (may have warm Akamai cookies)
-        logger.info("TwayAir: nodriver failed, trying CDP Chrome fallback")
+        # Strategy 3: CDP Chrome with persistent profile (may have warm Akamai cookies)
+        logger.info("TwayAir: nodriver failed, trying CDP Chrome fallback (tier 3)")
         return await self._attempt_cdp(req)
+
+    # ------------------------------------------------------------------
+    # Tier 1: curl_cffi fast path (reuses Akamai cookies from browser)
+    # ------------------------------------------------------------------
+
+    async def _search_via_api(self, req: FlightSearchRequest) -> Optional[list[FlightOffer]]:
+        """POST /ajax/booking/getLowestFare via curl_cffi with cached cookies.
+
+        Returns parsed offers on success, None if cookies missing/stale or request fails.
+        """
+        if not HAS_CURL:
+            return None
+
+        global _tw_cookies, _tw_cookies_ts, _tw_csrf_token, _tw_csrf_header
+        if not _tw_cookies or not _tw_csrf_token:
+            return None
+        if (time.monotonic() - _tw_cookies_ts) > _COOKIE_MAX_AGE:
+            logger.info("TwayAir: cached cookies expired (>%ds)", _COOKIE_MAX_AGE)
+            return None
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self._search_via_api_sync, req,
+            dict(_tw_cookies), _tw_csrf_token, _tw_csrf_header,
+        )
+
+    def _search_via_api_sync(
+        self,
+        req: FlightSearchRequest,
+        cookies: dict,
+        csrf_token: str,
+        csrf_header: str,
+    ) -> Optional[list[FlightOffer]]:
+        """Synchronous curl_cffi POST to getLowestFare."""
+        sess = cffi_requests.Session(impersonate=_IMPERSONATE)
+
+        for name, value in cookies.items():
+            sess.cookies.set(name, value, domain="www.twayair.com")
+
+        is_domestic = req.origin in _DOMESTIC_AIRPORTS and req.destination in _DOMESTIC_AIRPORTS
+        booking_type = "DOM" if is_domestic else "INT"
+        currency = self._determine_currency(req, is_domestic)
+
+        form_data = {
+            "tripType": "OW",
+            "bookingType": booking_type,
+            "currency": currency,
+            "depAirport": req.origin,
+            "arrAirport": req.destination,
+            "baseDeptAirportCode": req.origin,
+            "_csrf": csrf_token,
+        }
+
+        try:
+            r = sess.post(
+                "https://www.twayair.com/ajax/booking/getLowestFare",
+                data=form_data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "X-Requested-With": "XMLHttpRequest",
+                    csrf_header: csrf_token,
+                    "Referer": "https://www.twayair.com/app/main",
+                    "Origin": "https://www.twayair.com",
+                },
+                timeout=15,
+            )
+        except Exception as e:
+            logger.warning("TwayAir [curl_cffi]: request failed: %s", e)
+            return None
+
+        if r.status_code != 200:
+            logger.warning("TwayAir [curl_cffi]: HTTP %d", r.status_code)
+            return None
+
+        text = r.text
+        if not text:
+            logger.warning("TwayAir [curl_cffi]: empty response body")
+            return None
+
+        logger.info("TwayAir [curl_cffi]: got %d bytes, parsing", len(text))
+        return self._parse_fare_response(text, req, currency)
+
+    # ------------------------------------------------------------------
+    # Cookie caching helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _cache_cookies_from_nodriver_async(page) -> None:
+        """Extract cookies from a nodriver page and cache them for curl_cffi."""
+        global _tw_cookies, _tw_cookies_ts, _tw_csrf_token, _tw_csrf_header
+        try:
+            raw = await page.evaluate("""
+                (() => {
+                    const pairs = {};
+                    document.cookie.split('; ').forEach(c => {
+                        const [k, ...v] = c.split('=');
+                        if (k) pairs[k] = v.join('=');
+                    });
+                    return pairs;
+                })()
+            """)
+            if raw and isinstance(raw, dict):
+                _tw_cookies = raw
+                _tw_cookies_ts = time.monotonic()
+                logger.info("TwayAir: cached %d cookies from nodriver", len(raw))
+        except Exception as e:
+            logger.debug("TwayAir: cookie caching from nodriver failed: %s", e)
+
+    @staticmethod
+    async def _cache_cookies_from_cdp(context) -> None:
+        """Extract cookies from a Playwright CDP context and cache them."""
+        global _tw_cookies, _tw_cookies_ts
+        try:
+            all_cookies = await context.cookies()
+            cookie_dict = {c["name"]: c["value"] for c in all_cookies if "twayair" in c.get("domain", "")}
+            if cookie_dict:
+                _tw_cookies = cookie_dict
+                _tw_cookies_ts = time.monotonic()
+                logger.info("TwayAir: cached %d cookies from CDP", len(cookie_dict))
+        except Exception as e:
+            logger.debug("TwayAir: cookie caching from CDP failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Tier 2: nodriver (undetected-chromedriver)
+    # ------------------------------------------------------------------
 
     async def _attempt_nodriver(self, req: FlightSearchRequest) -> Optional[list[FlightOffer]]:
         page = await _get_nodriver_page()
@@ -307,6 +458,15 @@ class TwayAirConnectorClient:
 
             csrf_token = csrf_info.get("token", "") if isinstance(csrf_info, dict) else ""
             csrf_header = csrf_info.get("header", "X-CSRF-TOKEN") if isinstance(csrf_info, dict) else "X-CSRF-TOKEN"
+
+            # Cache CSRF for curl_cffi reuse
+            if csrf_token:
+                global _tw_csrf_token, _tw_csrf_header
+                _tw_csrf_token = csrf_token
+                _tw_csrf_header = csrf_header
+
+            # Cache cookies for curl_cffi reuse
+            await self._cache_cookies_from_nodriver_async(page)
 
             is_domestic = req.origin in _DOMESTIC_AIRPORTS and req.destination in _DOMESTIC_AIRPORTS
             booking_type = "DOM" if is_domestic else "INT"
@@ -372,6 +532,15 @@ class TwayAirConnectorClient:
 
             csrf_token = csrf_info.get("token", "")
             csrf_header = csrf_info.get("header", "X-CSRF-TOKEN")
+
+            # Cache CSRF for curl_cffi reuse
+            if csrf_token:
+                global _tw_csrf_token, _tw_csrf_header
+                _tw_csrf_token = csrf_token
+                _tw_csrf_header = csrf_header
+
+            # Cache cookies for curl_cffi reuse
+            await self._cache_cookies_from_cdp(context)
 
             is_domestic = req.origin in _DOMESTIC_AIRPORTS and req.destination in _DOMESTIC_AIRPORTS
             booking_type = "DOM" if is_domestic else "INT"
