@@ -37,7 +37,7 @@ from models.flights import (
     FlightSearchResponse,
     FlightSegment,
 )
-from connectors.browser import stealth_args, stealth_position_arg, stealth_popen_kwargs
+from connectors.browser import find_chrome, stealth_popen_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ def _get_lock() -> asyncio.Lock:
 
 
 async def _get_browser():
-    """Launch real Chrome via CDP, or fall back to Playwright headed."""
+    """Launch real Chrome via CDP (headed — KPSDK detects --headless=new)."""
     global _pw_instance, _browser, _chrome_proc
     lock = _get_lock()
     async with lock:
@@ -91,17 +91,73 @@ async def _get_browser():
             except Exception:
                 pass
 
-        try:
-            from connectors.browser import get_or_launch_cdp
-            _browser, _chrome_proc = await get_or_launch_cdp(_DEBUG_PORT, _USER_DATA_DIR)
-            logger.info("Wizzair: Chrome ready via CDP (port %d)", _DEBUG_PORT)
-            return _browser
-        except Exception as e:
-            logger.warning("Wizzair: CDP failed: %s, falling back to Playwright", e)
+        from playwright.async_api import async_playwright
 
-        from connectors.browser import launch_headed_browser
-        _browser = await launch_headed_browser()
-        logger.info("Wizzair: Playwright browser launched (fallback)")
+        if _pw_instance:
+            try:
+                await _pw_instance.stop()
+            except Exception:
+                pass
+        _pw_instance = await async_playwright().start()
+
+        # Try connecting to already-running Chrome on the debug port
+        try:
+            _browser = await _pw_instance.chromium.connect_over_cdp(
+                f"http://localhost:{_DEBUG_PORT}"
+            )
+            logger.info("Wizzair: connected to existing Chrome via CDP")
+            return _browser
+        except Exception:
+            pass
+
+        # Launch real Chrome WITHOUT --headless=new (Kasada fingerprints it)
+        chrome_path = find_chrome()
+        if chrome_path:
+            os.makedirs(_USER_DATA_DIR, exist_ok=True)
+            vp = random.choice(_VIEWPORTS)
+            _chrome_proc = subprocess.Popen(
+                [
+                    chrome_path,
+                    f"--remote-debugging-port={_DEBUG_PORT}",
+                    f"--user-data-dir={_USER_DATA_DIR}",
+                    f"--window-size={vp['width']},{vp['height']}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-background-networking",
+                    "--window-position=-2400,-2400",
+                    "about:blank",
+                ],
+                **stealth_popen_kwargs(),
+            )
+            await asyncio.sleep(2.5)
+            try:
+                _browser = await _pw_instance.chromium.connect_over_cdp(
+                    f"http://localhost:{_DEBUG_PORT}"
+                )
+                logger.info("Wizzair: CDP Chrome connected (port %d)", _DEBUG_PORT)
+                return _browser
+            except Exception as e:
+                logger.warning("Wizzair: CDP connect failed: %s, falling back", e)
+                if _chrome_proc:
+                    _chrome_proc.terminate()
+                    _chrome_proc = None
+
+        # Fallback: Playwright headed (no headless — KPSDK needs it)
+        try:
+            _browser = await _pw_instance.chromium.launch(
+                headless=False,
+                channel="chrome",
+                args=["--disable-blink-features=AutomationControlled",
+                      "--window-position=-2400,-2400"],
+            )
+        except Exception:
+            _browser = await _pw_instance.chromium.launch(
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled",
+                      "--no-sandbox",
+                      "--window-position=-2400,-2400"],
+            )
+        logger.info("Wizzair: Playwright browser launched (headed fallback)")
         return _browser
 
 
