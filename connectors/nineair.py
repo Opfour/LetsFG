@@ -85,20 +85,8 @@ async def _get_browser():
     global _browser, _pw_instance
     if _browser and _browser.is_connected():
         return _browser
-
-    from playwright.async_api import async_playwright
-    _pw_instance = await async_playwright().start()
-    try:
-        _browser = await _pw_instance.chromium.launch(
-            headless=True,
-            channel="chrome",
-            args=[*stealth_args(), "--lang=zh-CN"],
-        )
-    except Exception:
-        _browser = await _pw_instance.chromium.launch(
-            headless=True,
-            args=[*stealth_args(), "--lang=zh-CN"],
-        )
+    from connectors.browser import launch_headed_browser
+    _browser = await launch_headed_browser(extra_args=["--lang=zh-CN"])
     logger.info("9 Air: browser launched")
     return _browser
 

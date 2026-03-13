@@ -21,7 +21,6 @@ import asyncio
 import hashlib
 import logging
 import os
-import shutil
 import subprocess
 import time
 from datetime import datetime
@@ -56,68 +55,15 @@ def _get_lock() -> asyncio.Lock:
     return _page_lock
 
 
-def _find_chrome() -> str:
-    candidates = [
-        os.environ.get("CHROME_PATH", ""),
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        shutil.which("google-chrome") or "",
-        shutil.which("chrome") or "",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    ]
-    for c in candidates:
-        if c and os.path.isfile(c):
-            return c
-    raise RuntimeError("Chrome not found — set CHROME_PATH env var")
-
-
-async def _launch_chrome() -> subprocess.Popen:
-    chrome = _find_chrome()
-    user_data = os.path.abspath(_USER_DATA_DIR)
-    os.makedirs(user_data, exist_ok=True)
-    args = [
-        chrome,
-        f"--remote-debugging-port={_CDP_PORT}",
-        f"--user-data-dir={user_data}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-background-networking",
-        "--disable-sync",
-        "--disable-translate",
-        "--disable-extensions",
-        "--window-size=1440,900",
-        *stealth_args(),
-        "about:blank",
-    ]
-    proc = subprocess.Popen(
-        args,
-        **stealth_popen_kwargs(),
-    )
-    await asyncio.sleep(2)
-    return proc
-
-
 async def _get_browser():
     global _pw_instance, _cdp_browser, _chrome_proc
     if _cdp_browser and _cdp_browser.is_connected():
         return _cdp_browser
-    if _chrome_proc is None or _chrome_proc.poll() is not None:
-        _chrome_proc = await _launch_chrome()
-    from playwright.async_api import async_playwright
-    if _pw_instance is None:
-        _pw_instance = await async_playwright().start()
-    for attempt in range(8):
-        try:
-            _cdp_browser = await _pw_instance.chromium.connect_over_cdp(
-                f"http://127.0.0.1:{_CDP_PORT}"
-            )
-            logger.info("GOL: connected to Chrome via CDP port %d", _CDP_PORT)
-            return _cdp_browser
-        except Exception:
-            await asyncio.sleep(1)
-    raise RuntimeError(f"Failed to connect to Chrome CDP on port {_CDP_PORT}")
+    from connectors.browser import get_or_launch_cdp
+    _user_data = os.path.abspath(_USER_DATA_DIR)
+    _cdp_browser, _chrome_proc = await get_or_launch_cdp(_CDP_PORT, _user_data)
+    logger.info("GOL: Chrome ready via CDP (port %d)", _CDP_PORT)
+    return _cdp_browser
 
 
 async def _ensure_persistent_page():

@@ -89,20 +89,9 @@ async def _get_browser():
     global _pw_instance, _browser
     if _browser and _browser.is_connected():
         return _browser
-    from playwright.async_api import async_playwright
-    _pw_instance = await async_playwright().start()
-    try:
-        _browser = await _pw_instance.chromium.launch(
-            headless=True,
-            channel="chrome",
-            args=["--disable-blink-features=AutomationControlled", *stealth_args()],
-        )
-    except Exception:
-        _browser = await _pw_instance.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", *stealth_args()],
-        )
-    logger.info("Norwegian: Playwright browser launched for cookie farming")
+    from connectors.browser import launch_headed_browser
+    _browser = await launch_headed_browser()
+    logger.info("Norwegian: browser launched for cookie farming")
     return _browser
 
 

@@ -72,23 +72,6 @@ _chrome_proc = None
 _browser_lock: Optional[asyncio.Lock] = None
 
 
-def _find_chrome() -> Optional[str]:
-    """Find Chrome executable on the system."""
-    candidates = [
-        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
-        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
-        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium-browser",
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return None
-
-
 def _get_lock() -> asyncio.Lock:
     global _browser_lock
     if _browser_lock is None:
@@ -97,10 +80,9 @@ def _get_lock() -> asyncio.Lock:
 
 
 async def _get_browser():
-    """Launch real Chrome via subprocess + connect via CDP.
+    """Launch real Chrome via CDP, or fall back to Playwright headed.
 
     Uses a persistent user-data-dir so Akamai clearance persists across runs.
-    Falls back to regular Playwright launch if Chrome is not found.
     """
     global _pw_instance, _browser, _chrome_proc
     lock = _get_lock()
@@ -112,68 +94,17 @@ async def _get_browser():
             except Exception:
                 pass
 
-        from playwright.async_api import async_playwright
-
-        if _pw_instance:
-            try:
-                await _pw_instance.stop()
-            except Exception:
-                pass
-        _pw_instance = await async_playwright().start()
-
-        chrome_path = _find_chrome()
-        if chrome_path:
-            os.makedirs(_USER_DATA_DIR, exist_ok=True)
-            # Try connecting to existing Chrome first
-            try:
-                _browser = await _pw_instance.chromium.connect_over_cdp(
-                    f"http://localhost:{_DEBUG_PORT}"
-                )
-                logger.info("Scoot: connected to existing Chrome via CDP")
-                return _browser
-            except Exception:
-                pass
-
-            vp = random.choice(_VIEWPORTS)
-            _chrome_proc = subprocess.Popen(
-                [
-                    chrome_path,
-                    f"--remote-debugging-port={_DEBUG_PORT}",
-                    f"--user-data-dir={_USER_DATA_DIR}",
-                    f"--window-size={vp['width']},{vp['height']}",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-background-networking",
-                    *stealth_position_arg(),
-                    "about:blank",
-                ],
-                **stealth_popen_kwargs(),
-            )
-            await asyncio.sleep(2.5)
-            try:
-                _browser = await _pw_instance.chromium.connect_over_cdp(
-                    f"http://localhost:{_DEBUG_PORT}"
-                )
-                logger.info("Scoot: connected to real Chrome via CDP (port %d)", _DEBUG_PORT)
-                return _browser
-            except Exception as e:
-                logger.warning("Scoot: CDP connect failed: %s, falling back", e)
-                if _chrome_proc:
-                    _chrome_proc.terminate()
-                    _chrome_proc = None
-
-        # Fallback: regular Playwright headed Chrome
         try:
-            _browser = await _pw_instance.chromium.launch(
-                headless=True, channel="chrome",
-                args=["--disable-blink-features=AutomationControlled", *stealth_args()],
-            )
-        except Exception:
-            _browser = await _pw_instance.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", *stealth_args()],
-            )
-        logger.info("Scoot: Playwright browser launched (headed Chrome, fallback)")
+            from connectors.browser import get_or_launch_cdp
+            _browser, _chrome_proc = await get_or_launch_cdp(_DEBUG_PORT, _USER_DATA_DIR)
+            logger.info("Scoot: Chrome ready via CDP (port %d)", _DEBUG_PORT)
+            return _browser
+        except Exception as e:
+            logger.warning("Scoot: CDP failed: %s, falling back to Playwright", e)
+
+        from connectors.browser import launch_headed_browser
+        _browser = await launch_headed_browser()
+        logger.info("Scoot: Playwright browser launched (fallback)")
         return _browser
 
 

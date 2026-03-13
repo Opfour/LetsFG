@@ -133,21 +133,9 @@ async def _get_browser():
     async with lock:
         if _browser and _browser.is_connected():
             return _browser
-        from playwright.async_api import async_playwright
-
-        _pw_instance = await async_playwright().start()
-        try:
-            _browser = await _pw_instance.chromium.launch(
-                headless=True,
-                channel="chrome",
-                args=["--disable-blink-features=AutomationControlled", *stealth_args()],
-            )
-        except Exception:
-            _browser = await _pw_instance.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", *stealth_args()],
-            )
-        logger.info("Jet2: Playwright browser launched (headed Chrome)")
+        from connectors.browser import launch_headed_browser
+        _browser = await launch_headed_browser()
+        logger.info("Jet2: browser launched")
         return _browser
 
 
@@ -162,12 +150,7 @@ async def _reset_browser():
             except Exception:
                 pass
             _browser = None
-        if _pw_instance:
-            try:
-                await _pw_instance.stop()
-            except Exception:
-                pass
-            _pw_instance = None
+        _pw_instance = None
 
 
 class Jet2ConnectorClient:

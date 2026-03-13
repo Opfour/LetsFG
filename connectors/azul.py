@@ -48,13 +48,6 @@ _AVAIL_API = "reservationavailability/api/reservation/availability"
 _MAX_ATTEMPTS = 3
 _API_WAIT = 20  # seconds to wait for availability API per attempt
 
-_CHROME_PATHS = [
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-]
 _CDP_PORT = 9467
 _USER_DATA_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", ".azul_chrome_data"
@@ -73,45 +66,6 @@ def _get_lock() -> asyncio.Lock:
     if _ctx_lock is None:
         _ctx_lock = asyncio.Lock()
     return _ctx_lock
-
-
-def _find_chrome() -> Optional[str]:
-    for p in _CHROME_PATHS:
-        if os.path.isfile(p):
-            return p
-    return None
-
-
-async def _launch_chrome() -> subprocess.Popen:
-    """Launch real Chrome with remote debugging."""
-    global _chrome_proc
-    if _chrome_proc and _chrome_proc.poll() is None:
-        return _chrome_proc
-
-    chrome = _find_chrome()
-    if not chrome:
-        raise RuntimeError("Chrome not found — Azul requires real Chrome for Akamai bypass")
-
-    os.makedirs(_USER_DATA_DIR, exist_ok=True)
-    _chrome_proc = subprocess.Popen(
-        [
-            chrome,
-            f"--remote-debugging-port={_CDP_PORT}",
-            f"--user-data-dir={_USER_DATA_DIR}",
-            "--window-size=1366,768",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            *stealth_args(),
-            "about:blank",
-        ],
-        **stealth_popen_kwargs(),
-    )
-    await asyncio.sleep(3)
-    logger.info("Azul: Chrome launched on CDP port %d", _CDP_PORT)
-    return _chrome_proc
 
 
 async def _wait_akamai(page, timeout: float = 15) -> bool:
@@ -144,15 +98,9 @@ async def _ensure_warm_ctx(force: bool = False):
                 _ctx_ready = False
 
         # Launch Chrome & connect via CDP
-        await _launch_chrome()
-
-        from playwright.async_api import async_playwright
-        pw = await async_playwright().start()
-        try:
-            browser = await pw.chromium.connect_over_cdp(f"http://localhost:{_CDP_PORT}")
-        except Exception as e:
-            logger.error("Azul: CDP connect failed: %s", e)
-            raise RuntimeError(f"CDP connect failed: {e}")
+        from connectors.browser import get_or_launch_cdp
+        _user_data = os.path.abspath(_USER_DATA_DIR)
+        browser, _chrome_proc = await get_or_launch_cdp(_CDP_PORT, _user_data)
 
         # Create fresh context
         ctx = await browser.new_context(
