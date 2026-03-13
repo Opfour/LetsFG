@@ -56,12 +56,12 @@
 | 2 | azul | AD | [#33](https://github.com/Boosted-Chat/BoostedTravel/issues/33) | `done` | claude-connector-fix | 2026-03-13T21:00Z | Switched to headed Chrome + route interception. Akamai blocks headless; SPA sends empty criteria → rewrite via page.route(). Tested VCP→CNF (8), GRU→SSA (20), CNF→SSA (26). |
 | 3 | batikair | ID | — | `done` | copilot-batikair-fix | 2026-03-13T18:11Z | nodriver CF bypass + PW DOM extraction, MYR |
 | 4 | cebupacific | 5J | [#16](https://github.com/Boosted-Chat/BoostedTravel/issues/16) | `claimed` | copilot-main | 2026-03-13T18:15Z | |
-| 5 | easyjet | U2 | [#20](https://github.com/Boosted-Chat/BoostedTravel/issues/20) | `claimed` | copilot-batikair-fix | 2026-03-13T18:20Z | |
+| 5 | easyjet | U2 | [#20](https://github.com/Boosted-Chat/BoostedTravel/issues/20) | `done` | copilot-batikair-fix | 2026-03-13T21:11Z | Headed Chrome + form fill + response interception. Akamai blocks headless; fresh profile on 403. Tested LGW→BCN (4 offers). |
 | 6 | eurowings | EW | — | `done` | copilot-eurowings-fix | 2026-03-13T20:51Z | cookie-farm hybrid: curl_cffi + CF cookies |
 | 7 | flynas | XY | — | `done` | copilot-eurowings-fix | 2026-03-13T21:00Z | persistent headed Chrome, bypass Akamai headless detection |
 | 8 | gol | G3 | [#34](https://github.com/Boosted-Chat/BoostedTravel/issues/34) | `done` | claude-connector-fix | 2026-03-13T21:07Z | Switched to headed Chrome. Akamai blocked headless; UUID now populates via waitForFunction. Tested GRU->GIG (5), CGH->SDU (24). |
-| 9 | indigo | 6E | [#17](https://github.com/Boosted-Chat/BoostedTravel/issues/17) | `broken` | | | |
-| 10 | jet2 | LS | [#32](https://github.com/Boosted-Chat/BoostedTravel/issues/32) | `broken` | | | |
+| 9 | indigo | 6E | [#17](https://github.com/Boosted-Chat/BoostedTravel/issues/17) | `claimed` | claude-connector-fix | 2026-03-13T21:08Z | |
+| 10 | jet2 | LS | [#32](https://github.com/Boosted-Chat/BoostedTravel/issues/32) | `claimed` | copilot-eurowings-fix | 2026-03-13T21:30Z | |
 | 11 | jetsmart | JA | — | `broken` | | | |
 | 12 | jetstar | JQ | [#31](https://github.com/Boosted-Chat/BoostedTravel/issues/31) | `broken` | | | |
 | 13 | lionair | JT | [#35](https://github.com/Boosted-Chat/BoostedTravel/issues/35) | `broken` | | | |
