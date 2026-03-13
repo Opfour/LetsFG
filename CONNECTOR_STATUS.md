@@ -55,9 +55,9 @@
 | 1 | airasia | AK | [#19](https://github.com/Boosted-Chat/BoostedTravel/issues/19) | `done` | copilot-main | 2026-03-13T17:00Z | headed Chrome + API interception |
 | 2 | azul | AD | [#33](https://github.com/Boosted-Chat/BoostedTravel/issues/33) | `claimed` | claude-connector-fix | 2026-03-13T17:00Z | |
 | 3 | batikair | ID | — | `done` | copilot-batikair-fix | 2026-03-13T18:11Z | nodriver CF bypass + PW DOM extraction, MYR |
-| 4 | cebupacific | 5J | [#16](https://github.com/Boosted-Chat/BoostedTravel/issues/16) | `broken` | | | |
-| 5 | easyjet | U2 | [#20](https://github.com/Boosted-Chat/BoostedTravel/issues/20) | `broken` | | | |
-| 6 | eurowings | EW | — | `broken` | | | |
+| 4 | cebupacific | 5J | [#16](https://github.com/Boosted-Chat/BoostedTravel/issues/16) | `claimed` | copilot-main | 2026-03-13T18:15Z | |
+| 5 | easyjet | U2 | [#20](https://github.com/Boosted-Chat/BoostedTravel/issues/20) | `claimed` | copilot-batikair-fix | 2026-03-13T18:20Z | |
+| 6 | eurowings | EW | — | `done` | copilot-eurowings-fix | 2026-03-13T20:51Z | cookie-farm hybrid: curl_cffi + CF cookies |
 | 7 | flynas | XY | — | `broken` | | | |
 | 8 | gol | G3 | [#34](https://github.com/Boosted-Chat/BoostedTravel/issues/34) | `broken` | | | |
 | 9 | indigo | 6E | [#17](https://github.com/Boosted-Chat/BoostedTravel/issues/17) | `broken` | | | |
