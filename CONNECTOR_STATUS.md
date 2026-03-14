@@ -89,7 +89,7 @@
 |---|-----------|------|-------|--------|--------|
 | 26 | allegiant | G4 | [#38](https://github.com/Boosted-Chat/BoostedTravel/issues/38) | `done` | **US IP required.** Headed Chrome + GraphQL interception. Set ALLEGIANT_PROXY if outside US. |
 | 27 | southwest | WN | [#26](https://github.com/Boosted-Chat/BoostedTravel/issues/26) | `done` | **US IP required.** Headed Chrome + Playwright form fill + API interception. Set SOUTHWEST_PROXY if outside US. |
-| 28 | spirit | NK | [#28](https://github.com/Boosted-Chat/BoostedTravel/issues/28) | `blocked` | PerimeterX blocks all automated access |
+| 28 | spirit | NK | [#28](https://github.com/Boosted-Chat/BoostedTravel/issues/28) | `blocked` | PerimeterX blocks CDP+Playwright from EU IPs (403). Code uses page.evaluate(fetch) approach (like Wizzair) but PX detects automation and geo-blocks. Needs US proxy. — `copilot-eurowings-fix` |
 | 29 | smartwings | QS | [#23](https://github.com/Boosted-Chat/BoostedTravel/issues/23) | `done` | Headed CDP Chrome + CF Turnstile bypass (launch with URL before CDP attaches) |
 | 30 | transavia | HV | [#25](https://github.com/Boosted-Chat/BoostedTravel/issues/25) | `done` | Headed CDP Chrome to bypass Cloudflare WAF |
 | 31 | wizzair | W6 | [#27](https://github.com/Boosted-Chat/BoostedTravel/issues/27) | `done` | Fixed: launch Chrome headed (Kasada detects --headless=new) — `copilot-eurowings-fix` |
@@ -112,7 +112,7 @@
 | # | Connector | IATA | Type | Status | Reason |
 |---|-----------|------|------|--------|--------|
 | 40 | jetblue | B6 | LCC | `done` | bestFares calendar API (no auth, ~2s), Playwright fallback for details. 114+ destinations. |
-| 41 | breeze | MX | LCC | `broken` | **US IP required.** 75 destinations, unique unserved city pairs (A220 fleet). flybreeze.com. |
+| 41 | breeze | MX | LCC | `done` | Playwright API interception (Navitaire NewSkies GraphQL). 75+ US routes. flybreeze.com. |
 | 42 | avelo | XP | ULCC | `done` | Playwright deep-link scraper. 42 US domestic routes. Deep link URL bypasses form fill. Blazor WASM app. |
 | 43 | suncountry | SY | ULCC | `broken` | **US IP required.** 81+ destinations from MSP hub, best low-cost carrier NA. suncountry.com. |
 | 44 | alaska | AS | Major | `broken` | **US IP required.** West Coast dominant + Hawaii monopoly (post-Hawaiian merger). alaskaair.com. |
