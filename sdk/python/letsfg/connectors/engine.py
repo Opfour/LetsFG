@@ -1,7 +1,7 @@
 """
 Unified flight search engine — fires ALL sources in parallel:
 
-1. Local agent-device connectors (195 airline connectors) — zero auth, free
+1. Local agent-device connectors (200 airline connectors) — zero auth, free
 2. Cloud Run backend API (Duffel, Amadeus, Sabre, Travelport, etc.) — paid providers
 
 Both fire simultaneously via asyncio.gather. The backend call is a single
@@ -260,20 +260,19 @@ _BROWSER_SOURCES: set[str] = {
     "american_direct",
     "united_direct",
     "delta_direct",
-    "cathay_direct",
+    # cathay → curl_cffi-only, removed from browser set
     "singapore_direct",
     "korean_direct",
     "nh_direct",
     "bangkokairways_direct",
-    "aegean_direct", "aerlingus_direct", "aircanada_direct",
-    "airnewzealand_direct", "ethiopian_direct", "finnair_direct",
-    "kenyaairways_direct", "philippineairlines_direct", "qantas_direct",
-    "royalairmaroc_direct", "saa_direct", "sas_direct",
-    "skyairline_direct", "tap_direct", "wingo_direct",
+    # aegean, sas, tap → httpx/curl_cffi-only, removed from browser set
+    "airnewzealand_direct", "finnair_direct",
+    "philippineairlines_direct", "qantas_direct",
+    "skyairline_direct", "wingo_direct",
     "aerolineas_direct", "chinaairlines_direct",
-    "elal_direct", "saudia_direct",
+    "saudia_direct",  # elal → httpx-only, removed
     "airchina_direct", "chinaeastern_direct", "chinasouthern_direct",
-    "vietnamairlines_direct", "asiana_direct", "airtransat_direct",
+    "asiana_direct", "airtransat_direct",  # vietnamairlines → httpx-only, removed
     "airserbia_direct", "aireuropa_direct", "mea_direct",
     "hainan_direct", "royaljordanian_direct", "kuwaitairways_direct",
     "level_direct",
@@ -294,7 +293,7 @@ _BROWSER_SOURCES: set[str] = {
 
     "aviasales_meta",
     "travix_ota",
-    "travelup_ota",
+    # travelup → httpx-only, removed from browser set
     "lastminute_ota",
     "byojet_ota",
     "yatra_ota",
@@ -1063,9 +1062,11 @@ class MultiProvider:
                     "connector": provider, "ok": False, "offers": 0, "latency_ms": 0,
                 })
             elif isinstance(result, FlightSearchResponse):
+                # ok=True if connector ran successfully (even with 0 offers)
+                # 0 offers is valid when route doesn't exist on that airline
                 connector_results.append({
                     "connector": provider,
-                    "ok": result.total_results > 0,
+                    "ok": True,
                     "offers": result.total_results,
                     "latency_ms": 0,
                 })
