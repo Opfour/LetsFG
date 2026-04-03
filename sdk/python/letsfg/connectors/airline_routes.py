@@ -1345,6 +1345,12 @@ AIRLINE_COUNTRIES: dict[str, set[str]] = {
         "AR", "BR", "CL", "CO", "MX", "PE", "EC", "UY", "CR", "PA",
         "DO", "PR", "US", "IT", "ES", "FR", "PT", "GB", "DE",
     },
+    "hopper": {
+        "US", "CA", "MX", "GB", "FR", "DE", "ES", "IT", "PT",
+        "CO", "BR", "PE", "CL", "AR",
+        "JP", "KR", "IN", "TH",
+        "AE", "SA",
+    },
 }
 
 
@@ -1394,6 +1400,7 @@ def get_relevant_connectors(
         "musafir",
         "akbartravels", "airasiamove",
         "despegar",
+        "hopper",
     }
 
     relevant = []
