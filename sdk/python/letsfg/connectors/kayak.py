@@ -123,9 +123,12 @@ class KayakConnectorClient:
             page.on("response", on_response)
 
             dep_date = req.date_from.isoformat()
+            date_path = dep_date
+            if req.return_from:
+                date_path = f"{dep_date}/{req.return_from.isoformat()}"
             url = (
                 f"https://www.kayak.com/flights/"
-                f"{req.origin}-{req.destination}/{dep_date}"
+                f"{req.origin}-{req.destination}/{date_path}"
                 f"?sort=price_a"
             )
 

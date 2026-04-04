@@ -1400,6 +1400,9 @@ class MultiProvider:
         "tap_direct",
         # Meta-search engines that natively support city codes in URLs
         "skyscanner_meta",
+        "momondo_meta",
+        "kayak_meta",
+        "cheapflights_meta",
     }
 
     @classmethod

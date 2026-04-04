@@ -140,9 +140,12 @@ class MomondoConnectorClient:
             page.on("response", on_response)
 
             dep_date = req.date_from.isoformat()
+            date_path = f"{dep_date}/"
+            if req.return_from:
+                date_path = f"{dep_date}/{req.return_from.isoformat()}/"
             url = (
                 f"https://www.momondo.com/flight-search/"
-                f"{req.origin}-{req.destination}/{dep_date}/"
+                f"{req.origin}-{req.destination}/{date_path}"
                 f"{req.adults or 1}adult"
                 f"?sort=price_a"
             )
@@ -212,6 +215,14 @@ def _parse_booking_holdings_poll(
     legs_map: dict[str, dict] = data.get("legs", {})
     segs_map: dict[str, dict] = data.get("segments", {})
     airlines_map: dict[str, dict] = data.get("airlines", {})
+    date_path = req.date_from.isoformat()
+    if req.return_from:
+        date_path = f"{date_path}/{req.return_from.isoformat()}"
+    booking_url = (
+        f"{booking_base_url}/"
+        f"{req.origin}-{req.destination}/{date_path}/"
+        f"{req.adults or 1}adult"
+    )
 
     for result in data.get("results", []):
         try:
@@ -267,10 +278,7 @@ def _parse_booking_holdings_poll(
                 source=source,
                 source_tier="free",
                 is_locked=False,
-                booking_url=(
-                    f"{booking_base_url}/"
-                    f"{req.origin}-{req.destination}/{req.date_from.isoformat()}"
-                ),
+                booking_url=booking_url,
             ))
         except Exception as e:
             logger.warning("MOMONDO: parse result failed: %s", e)
