@@ -324,7 +324,12 @@ def _parse_results(
             if not airlines:
                 airlines = list({s.airline for s in ob_segs if s.airline})
 
-            booking_url = item.get("deeplink") or "https://www.rehlat.com/"
+            booking_url = item.get("deeplink") or (
+                f"https://www.rehlat.com/en/flights/{req.origin}-to-{req.destination}"
+                f"?departDate={req.date_from.isoformat()}"
+                f"&adults={req.adults or 1}&children={req.children or 0}"
+                + (f"&returnDate={req.return_from.isoformat()}" if req.return_from else "")
+            )
 
             sk = item.get("sortkingKey", "")
             h = hashlib.md5(
