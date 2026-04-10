@@ -77,7 +77,7 @@ async def _get_browser():
     async with lock:
         if _browser and _browser.is_connected():
             return _browser
-        from connectors.browser import launch_headed_browser
+        from .browser import launch_headed_browser
         _browser = await launch_headed_browser()
         logger.info("FlyDubai: browser launched")
         return _browser

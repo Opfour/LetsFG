@@ -398,7 +398,7 @@ class RyanairBookableConnector:
 
     Uses Playwright. Never submits payment. Safe for testing.
     """
-    from connectors.booking_base import BookableConnector, CheckoutProgress
+    from .booking_base import BookableConnector, CheckoutProgress
 
     AIRLINE_NAME = "Ryanair"
     SOURCE_TAG = "ryanair_direct"
@@ -412,7 +412,7 @@ class RyanairBookableConnector:
         *,
         base_url: str | None = None,
     ):
-        from connectors.booking_base import (
+        from .booking_base import (
             BookableConnector,
             CheckoutProgress,
             dismiss_overlays,

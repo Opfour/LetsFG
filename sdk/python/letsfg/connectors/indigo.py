@@ -138,7 +138,7 @@ async def _get_browser():
             pass
 
         # Launch real Chrome subprocess
-        from connectors.browser import find_chrome
+        from .browser import find_chrome
 
         chrome = find_chrome()
         os.makedirs(_USER_DATA_DIR, exist_ok=True)

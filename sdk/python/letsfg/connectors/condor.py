@@ -93,7 +93,7 @@ async def _get_browser():
     global _pw_instance, _browser
     if _browser and _browser.is_connected():
         return _browser
-    from connectors.browser import launch_headed_browser
+    from .browser import launch_headed_browser
     _browser = await launch_headed_browser()
     logger.info("Condor: browser launched for cookie farming")
     return _browser
@@ -323,7 +323,7 @@ class CondorConnectorClient:
                 headers={
                     "Accept": "application/json, text/plain, */*",
                     "Accept-Language": "en-US",
-                    "Referer": "https://www.condor.com/tca/us/flight/search",
+                    "Referer": "https://www.condor.com/en/flights",
                 },
                 timeout=15,
             )

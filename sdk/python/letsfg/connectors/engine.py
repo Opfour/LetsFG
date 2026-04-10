@@ -1261,7 +1261,7 @@ class MultiProvider:
         Called after a browser-based connector finishes so its Chrome process
         is freed without waiting for the full search to complete.
         """
-        from connectors.browser import cleanup_module_browsers
+        from .browser import cleanup_module_browsers
 
         mod = sys.modules.get(type(client).__module__)
         if mod:
@@ -1279,7 +1279,7 @@ class MultiProvider:
         _nd_browser etc.) in every imported connector module and terminates them.
         Only affects processes we created — never kills the user's own Chrome.
         """
-        from connectors.browser import cleanup_module_browsers, cleanup_all_browsers
+        from .browser import cleanup_module_browsers, cleanup_all_browsers
 
         modules_to_clean = []
         seen = set()
@@ -1370,7 +1370,7 @@ class MultiProvider:
         self, client: WizzairConnectorClient, req: FlightSearchRequest
     ) -> FlightSearchResponse:
         """Search Wizzair's website API directly — definitive LCC pricing."""
-        from connectors.browser import acquire_browser_slot, release_browser_slot
+        from .browser import acquire_browser_slot, release_browser_slot
         await acquire_browser_slot()
         try:
             result = await asyncio.wait_for(
@@ -1444,7 +1444,7 @@ class MultiProvider:
         try:
             # Phase 1: acquire browser slot (generous timeout, separate from search)
             if uses_browser:
-                from connectors.browser import acquire_browser_slot
+                from .browser import acquire_browser_slot
                 logger.warning("%s waiting for browser slot…", source)
                 try:
                     await asyncio.wait_for(acquire_browser_slot(), timeout=_slot_timeout)
@@ -1521,7 +1521,7 @@ class MultiProvider:
                     await self._cleanup_single_connector(client)
                 except Exception:
                     pass
-                from connectors.browser import release_browser_slot
+                from .browser import release_browser_slot
                 release_browser_slot()
 
     def _combo_search_fn(self, label: str):

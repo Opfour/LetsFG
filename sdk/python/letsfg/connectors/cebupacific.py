@@ -103,7 +103,7 @@ async def _get_browser():
         if _browser and _browser.is_connected():
             return _browser
 
-        from connectors.browser import find_chrome
+        from .browser import find_chrome
 
         chrome = find_chrome()
         user_data = os.path.join(

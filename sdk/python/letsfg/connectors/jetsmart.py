@@ -86,7 +86,7 @@ async def _get_browser():
     async with lock:
         if _browser and _browser.is_connected():
             return _browser
-        from connectors.browser import get_or_launch_cdp
+        from .browser import get_or_launch_cdp
         _user_data = os.path.join(os.environ.get("TEMP", "/tmp"), "chrome-cdp-jetsmart")
         _browser, _chrome_proc = await get_or_launch_cdp(_CDP_PORT, _user_data)
         logger.info("JetSMART: Chrome ready via CDP (port %d)", _CDP_PORT)

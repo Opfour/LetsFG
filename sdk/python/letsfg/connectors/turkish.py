@@ -60,7 +60,7 @@ _SPUTNIK_HEADERS = {
     "Referer": "https://mm-prerendering-static-prod.airtrfx.com/",
     "em-api-key": _SPUTNIK_KEY,
 }
-_SPUTNIK_MARKETS = ["TR", "GB", "US", "DE", "FR", "NL"]
+_SPUTNIK_MARKETS = ["TR", "GB", "US", "DE", "FR", "NL", "AE", "SA", "EG", "IN", "KR", "JP", "IT", "ES"]
 
 # Reverse lookup: airport code → city code (e.g. LHR → LON)
 _AIRPORT_TO_CITY: dict[str, str] = {}
@@ -305,7 +305,7 @@ class TurkishConnectorClient:
 
         try:
             from curl_cffi.requests import AsyncSession
-            async with AsyncSession(impersonate="chrome") as s:
+            async with AsyncSession(impersonate="chrome131") as s:
                 r = await s.post(_SPUTNIK_URL, json=payload, headers=_SPUTNIK_HEADERS, timeout=15)
             if r.status_code != 200:
                 logger.info("TK Sputnik: HTTP %d", r.status_code)

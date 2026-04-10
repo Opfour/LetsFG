@@ -441,7 +441,7 @@ class WizzairBookableConnector:
         *,
         base_url: str | None = None,
     ):
-        from connectors.booking_base import (
+        from .booking_base import (
             CheckoutProgress,
             dismiss_overlays,
             safe_click,
