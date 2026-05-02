@@ -220,6 +220,7 @@ from .byojet import ByojetConnectorClient
 from .yatra import YatraConnectorClient
 from .etraveli import EtraveliConnectorClient, TravelgenioConnectorClient
 from .ixigo import IxigoConnectorClient
+from .easemytrip import EasemytripConnectorClient
 from .rehlat import RehlatConnectorClient
 from .travelstart import TravelstartConnectorClient
 from .auntbetty import AuntbettyConnectorClient
@@ -236,6 +237,8 @@ from .hopper import HopperConnectorClient
 from .esky import EskyConnectorClient
 from .hkexpress import HKExpressConnectorClient
 from .aircairo import AirCairoConnectorClient
+from .allianceair import AllianceAirConnectorClient
+from .starair import StarAirConnectorClient
 
 from ..models.flights import AirlineSummary, FlightOffer, FlightSearchRequest, FlightSearchResponse
 
@@ -398,6 +401,9 @@ _FAST_MODE_SOURCES: set[str] = {
     "ryanair_direct", "wizzair_direct", "easyjet_direct", "southwest_direct",
     "spirit_direct", "frontier_direct", "allegiant_direct", "jetblue_direct",
     "vueling_direct", "norwegian_direct", "transavia_direct",
+    # ── India domestic/international LCCs ──
+    "indigo_direct", "spicejet_direct", "akasa_direct", "airindiaexpress_direct",
+    "allianceair_direct", "starair_direct", "easemytrip_ota",
     # ── Key full-service carriers (high user demand) ──
     "emirates_direct", "turkish_direct", "finnair_direct",
     # ── Kiwi is always included (global aggregator) ──
@@ -417,7 +423,7 @@ _ECONOMY_ONLY_SOURCES: set[str] = {
     "flyadeal_direct", "airarabia_direct", "salamair_direct",
     "indigo_direct", "spicejet_direct", "akasa_direct",
     "cebupacific_direct", "nokair_direct", "citilink_direct",
-    "airindiaexpress_direct", "peach_direct",
+    "airindiaexpress_direct", "allianceair_direct", "starair_direct", "peach_direct",
     "spring_direct", "9air_direct", "luckyair_direct",
     "superairjet_direct", "transnusa_direct",
     "transavia_direct", "level_direct", "volotea_direct",
@@ -735,6 +741,9 @@ _DIRECT_AIRLINE_connectorS: list[tuple[str, type, float]] = [
     ("esky_ota", EskyConnectorClient, 55.0),
     ("hkexpress_direct", HKExpressConnectorClient, 25.0),
     ("aircairo_direct", AirCairoConnectorClient, 45.0),
+    ("allianceair_direct", AllianceAirConnectorClient, 35.0),
+    ("starair_direct", StarAirConnectorClient, 35.0),
+    ("easemytrip_ota", EasemytripConnectorClient, 35.0),
 ]
 
 

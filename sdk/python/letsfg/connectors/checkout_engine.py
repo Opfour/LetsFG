@@ -877,6 +877,9 @@ _register(_base_cfg("Flybondi", "flybondi_direct",
 
 _register(_base_cfg("JetSMART", "jetsmart_direct",
     custom_checkout_handler="_jetsmart_checkout",
+    use_cdp_chrome=True,
+    cdp_port=9513,
+    cdp_user_data_dir="chrome-cdp-jetsmart",
     flight_cards_timeout=20000,
     flight_cards_selector="div[class*='rounded-lg'][class*='sm:grid']:has-text('Vuelo directo'):has-text('Tarifa desde'), div[class*='rounded-lg'][class*='sm:grid']:has-text('Direct flight'):has-text('Fare from')",
     first_flight_selectors=[
@@ -1013,7 +1016,7 @@ _register(_base_cfg("Air Cairo", "aircairo_direct",
     goto_timeout=60000,
     use_proxy=True,
     use_cdp_chrome=True,
-    cdp_port=9499,
+    cdp_port=9487,
     cdp_user_data_dir=".aircairo_chrome_data",
     homepage_url="https://online.aircairo.com/booking?lang=en-GB",
     homepage_wait_ms=4000,
@@ -1304,14 +1307,6 @@ _register(_base_cfg("IndiGo", "indigo_direct",
     flight_cards_selector="[class*='flight'], [class*='result']",
     fare_selectors=[
         "button:has-text('Saver')",
-        "button:has-text('Select')",
-    ],
-))
-
-_register(_base_cfg("SpiceJet", "spicejet_direct_api",
-    flight_cards_selector="[class*='flight'], [class*='result']",
-    fare_selectors=[
-        "button:has-text('Spice Value')",
         "button:has-text('Select')",
     ],
 ))
@@ -1901,7 +1896,7 @@ _register(_base_cfg("Virgin Australia", "virginaustralia_direct",
     ],
 ))
 
-# SpiceJet has dual source tags in engine (spicejet_direct vs spicejet_direct_api)
+# SpiceJet uses the canonical engine source tag for search and checkout.
 _register(_base_cfg("SpiceJet", "spicejet_direct",
     flight_cards_selector="[class*='flight'], [class*='result']",
     fare_selectors=[
@@ -2488,6 +2483,23 @@ class GenericCheckoutEngine:
 
             async def _connect_cdp(user_data_dir: str, *, label: str):
                 nonlocal _chrome_proc
+                # Try to reuse an already-running Chrome on this port first.
+                # This is critical for connectors like Air Cairo where the
+                # search connector has already launched Chrome with valid
+                # session cookies — a fresh Chrome would be anti-bot blocked.
+                try:
+                    browser_existing = await pw.chromium.connect_over_cdp(
+                        f"http://127.0.0.1:{config.cdp_port}",
+                        timeout=2000,
+                    )
+                    logger.info(
+                        "%s checkout: attached to existing Chrome on port %d",
+                        config.airline_name,
+                        config.cdp_port,
+                    )
+                    return browser_existing
+                except Exception:
+                    pass
                 logger.info(
                     "%s checkout: launching CDP Chrome on port %d using %s",
                     config.airline_name,
@@ -2670,6 +2682,7 @@ class GenericCheckoutEngine:
                     }}""")
 
             # ── Step 1: Navigate to booking page ─────────────────────
+            step = "started"  # guard: ensures step is always defined if an exception escapes a custom handler
 
             # Check for custom checkout handler (e.g. WizzAir needs Vue SPA injection)
             custom_page_prepared = False
@@ -3653,8 +3666,15 @@ class GenericCheckoutEngine:
         await _dismiss_overlays(page)
 
     async def _prepare_jetsmart_checkout_results(self, page, config: AirlineCheckoutConfig, offer: dict) -> bool:
+        """Navigate to the JetSMART flight-selection page.
+
+        Fast path: navigate directly to the offer's booking_url (the /select?... URL).
+        Fallback: replay the homepage search form.
+        Returns True once flight cards are visible.
+        """
         segments = ((offer.get("outbound") or {}).get("segments") or []) if isinstance(offer.get("outbound"), dict) else []
         if not segments:
+            logger.warning("JetSMART checkout: offer has no outbound segments")
             return False
 
         origin = str(segments[0].get("origin") or "").strip().upper()
@@ -3662,12 +3682,101 @@ class GenericCheckoutEngine:
         departure_value = str(segments[0].get("departure") or "").strip()
         departure_date = re.split(r"[T ]", departure_value, maxsplit=1)[0] if departure_value else ""
         if not origin or not destination or not departure_date:
+            logger.warning("JetSMART checkout: missing origin/destination/date in offer segments")
             return False
 
         try:
             target_date = datetime.strptime(departure_date, "%Y-%m-%d").date()
         except ValueError:
+            logger.warning("JetSMART checkout: invalid departure date '%s'", departure_date)
             return False
+
+        try:
+            from .browser import auto_block_if_proxied
+            await auto_block_if_proxied(page)
+        except Exception:
+            pass
+
+        try:
+            from playwright_stealth import stealth_async
+            await stealth_async(page)
+        except Exception:
+            pass
+
+        async def _wait_for_cards(deadline_seconds: int = 25) -> bool:
+            deadline = time.monotonic() + deadline_seconds
+            while time.monotonic() < deadline:
+                await self._dismiss_cookies(page, config)
+                try:
+                    from . import jetsmart as _js_mod
+                    await _js_mod.JetSmartConnectorClient(timeout=30.0)._remove_overlays(page)
+                except Exception:
+                    pass
+                try:
+                    cur = page.url.lower()
+                    if "chrome-error://" in cur:
+                        return False
+                    if await page.locator(config.flight_cards_selector).count() > 0:
+                        return True
+                except Exception:
+                    pass
+                await page.wait_for_timeout(500)
+            return False
+
+        # ── Fast path: navigate directly to the offer's booking URL ─────
+        direct_url = str(offer.get("booking_url") or "").strip()
+        if direct_url:
+            logger.info("JetSMART checkout: navigating directly to booking URL for %s→%s", origin, destination)
+            try:
+                await page.goto(direct_url, wait_until="domcontentloaded", timeout=config.goto_timeout)
+            except Exception as nav_err:
+                logger.warning("JetSMART checkout: direct URL goto failed (%s)", str(nav_err)[:100])
+            await page.wait_for_timeout(2000)
+            if await _wait_for_cards(25):
+                return True
+
+            # GeoIP redirect may have stripped query params from the select URL.
+            # Re-navigate using the GeoIP-detected market but with the original route params.
+            geoip_url = page.url
+            geoip_match = re.search(r"jetsmart\.com/([a-z]{2}/[a-z]{2})", geoip_url)
+            if geoip_match:
+                geoip_market = geoip_match.group(1)
+                retry_url = (
+                    f"https://jetsmart.com/{geoip_market}/select"
+                    f"?origin={origin}&destination={destination}"
+                    f"&departure={departure_date}&adults=1&children=0"
+                )
+                logger.info("JetSMART checkout: retrying with GeoIP market %s: %s", geoip_market, retry_url)
+                try:
+                    await page.goto(retry_url, wait_until="domcontentloaded", timeout=config.goto_timeout)
+                except Exception as nav_err2:
+                    logger.warning("JetSMART checkout: GeoIP retry goto failed (%s)", str(nav_err2)[:100])
+                # Wait for "Tarifa desde" to actually appear (SPA may take 30-60s to render)
+                try:
+                    await page.wait_for_function(
+                        "() => document.body.innerText.includes('Tarifa desde') || document.body.innerText.includes('Fare from')",
+                        timeout=60000,
+                    )
+                    await page.wait_for_timeout(1500)
+                except Exception:
+                    await page.wait_for_timeout(3000)
+                if await _wait_for_cards(10):
+                    return True
+                # DEBUG: dump page text to understand what's showing
+                try:
+                    _dbg_text = await page.evaluate("() => document.body.innerText.slice(0, 1000)")
+                    logger.warning("JetSMART DEBUG geoip-select page text: %s", _dbg_text[:500])
+                except Exception:
+                    pass
+
+            logger.warning("JetSMART checkout: direct URL did not surface flight cards (url=%s), trying homepage form fill", page.url[:120])
+
+        # ── Fallback: homepage form fill ────────────────────────────────
+        from . import jetsmart as jetsmart_module
+
+        helper = jetsmart_module.JetSmartConnectorClient(timeout=60.0)
+        market = jetsmart_module._MARKET_MAP.get(origin, "cl")
+        homepage = f"https://jetsmart.com/{market}/en"
 
         month_names_es = {
             1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo",
@@ -3682,24 +3791,6 @@ class GenericCheckoutEngine:
         month_es = f"{month_names_es[target_date.month]} {target_date.year}"
         month_en = f"{month_names_en[target_date.month]} {target_date.year}"
 
-        from . import jetsmart as jetsmart_module
-
-        helper = jetsmart_module.JetSmartConnectorClient(timeout=60.0)
-        market = jetsmart_module._MARKET_MAP.get(origin, "cl")
-        homepage = f"https://jetsmart.com/{market}/en"
-
-        try:
-            from .browser import auto_block_if_proxied
-            await auto_block_if_proxied(page)
-        except Exception:
-            pass
-
-        try:
-            from playwright_stealth import stealth_async
-            await stealth_async(page)
-        except Exception:
-            pass
-
         logger.info("JetSMART checkout: replaying homepage search for %s→%s", origin, destination)
 
         try:
@@ -3711,95 +3802,718 @@ class GenericCheckoutEngine:
         await page.wait_for_timeout(3000)
         await helper._remove_overlays(page)
         await page.wait_for_timeout(500)
-        await helper._set_one_way(page)
+
+        # Now that homepage session cookies are established, retry the select URL
+        # (it failed earlier because there were no session cookies yet)
+        _select_url = (
+            f"https://jetsmart.com/{market}/en/select"
+            f"?origin={origin}&destination={destination}"
+            f"&departure={departure_date}&adults=1&children=0"
+        )
+        logger.warning("JetSMART checkout: retrying select URL with session: %s", _select_url[:120])
+        try:
+            await page.goto(_select_url, wait_until="domcontentloaded", timeout=config.goto_timeout)
+            await page.wait_for_timeout(3000)
+            if await _wait_for_cards(30):
+                logger.warning("JetSMART checkout: select URL worked with session cookies!")
+                return True
+            _page_text = await page.evaluate("() => document.body.innerText.slice(0, 300)")
+            logger.warning("JetSMART checkout: select URL page text: %s", _page_text[:200])
+        except Exception as _sel_err:
+            logger.warning("JetSMART checkout: select URL retry failed: %s", str(_sel_err)[:100])
+
+        # Re-navigate to homepage for form fill
+        try:
+            await page.goto(homepage, wait_until="domcontentloaded", timeout=config.goto_timeout)
+        except Exception:
+            pass
+        await page.wait_for_timeout(3000)
+        await helper._remove_overlays(page)
         await page.wait_for_timeout(500)
+
+        # Set one-way mode with retry + explicit debug
+        for _ow_attempt in range(3):
+            _ow_result = await page.evaluate("""() => {
+                const targets = ['Solo ida', 'One way', 'One-way', 'Ida'];
+                const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+                let node;
+                while (node = tw.nextNode()) {
+                    const t = node.textContent.trim();
+                    for (const target of targets) {
+                        if (t === target) {
+                            node.parentElement.click();
+                            return 'clicked:' + t;
+                        }
+                    }
+                }
+                // Fallback: partial match in spans/divs
+                for (const el of document.querySelectorAll('div, span, label')) {
+                    const t = (el.textContent || '').trim();
+                    if (t === 'Solo ida' || t === 'One way') {
+                        el.click();
+                        return 'clicked_el:' + t;
+                    }
+                }
+                // List all candidate text nodes for debug
+                const candidates = [];
+                const tw2 = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+                let n2;
+                while (n2 = tw2.nextNode()) {
+                    const t2 = n2.textContent.trim();
+                    if (t2.length > 2 && t2.length < 20) candidates.push(t2);
+                }
+                return 'not_found:' + candidates.slice(0, 20).join('|');
+            }""")
+            logger.warning("JetSMART checkout: _set_one_way attempt %d result: %s", _ow_attempt + 1, str(_ow_result)[:120])
+            if isinstance(_ow_result, str) and _ow_result.startswith("clicked"):
+                break
+            await page.wait_for_timeout(1000)
+
+        await page.wait_for_timeout(800)
         await helper._remove_overlays(page)
 
-        if not await helper._fill_airport(page, origin, is_origin=True):
-            logger.warning("JetSMART checkout: could not select origin %s", origin)
-            return False
-        await page.wait_for_timeout(1000)
-
-        if not await helper._fill_airport(page, destination, is_origin=False):
-            logger.warning("JetSMART checkout: could not select destination %s", destination)
-            return False
-        await page.wait_for_timeout(500)
-
-        clicked_date = await page.evaluate(
-            r'''([day, monthEs, monthEn]) => {
-                const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
-                const visible = (element) => {
-                    if (!element) return false;
-                    const style = window.getComputedStyle(element);
-                    if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
-                        return false;
-                    }
-                    return !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
-                };
-
-                const input = document.querySelector('input[placeholder="Fecha de ida"], input[placeholder="Departure"], input[placeholder="Date"]');
-                if (input && visible(input)) {
-                    input.click();
-                }
-
-                const dayStr = String(day);
-                const monthHeadings = Array.from(document.querySelectorAll('div')).filter((element) => {
-                    if (!visible(element)) return false;
-                    const text = normalize(element.textContent || '');
-                    return text === monthEs || text === monthEn;
-                });
-
-                for (const heading of monthHeadings) {
-                    let container = heading;
-                    for (let depth = 0; depth < 5 && container; depth += 1) {
-                        const text = normalize(container.innerText || '');
-                        if (text.includes(monthEs) || text.includes(monthEn)) {
-                            const cells = Array.from(container.querySelectorAll('div')).filter((element) => {
-                                if (!visible(element)) return false;
-                                const rect = element.getBoundingClientRect();
-                                const text = normalize(element.textContent || '');
-                                return text === dayStr && rect.width > 0 && rect.width <= 80 && rect.height > 0 && rect.height <= 80;
-                            });
-                            for (const cell of cells) {
-                                cell.click();
-                                return true;
-                            }
-                        }
-                        container = container.parentElement;
-                    }
-                }
-
-                return false;
-            }''',
-            [target_date.day, month_es, month_en],
-        )
-        if not clicked_date:
-            logger.warning("JetSMART checkout: could not select departure date %s", departure_date)
-            return False
-        await page.wait_for_timeout(500)
-
-        await helper._click_search(page)
-
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            await self._dismiss_cookies(page, config)
-            await helper._remove_overlays(page)
+        async def _robust_fill_airport(iata: str, is_origin: bool) -> bool:
+            """Fill airport with up to 10s wait for the dropdown to appear."""
+            idx = 0 if is_origin else 1
+            # Debug: log all visible text inputs to verify correct indexing
             try:
-                if "chrome-error://" not in page.url.lower() and await page.locator(config.flight_cards_selector).count() > 0:
-                    return True
+                _all_inputs = await page.evaluate("""() => {
+                    const vis = (el) => {
+                        const s = getComputedStyle(el);
+                        return s.display !== 'none' && s.visibility !== 'hidden'
+                            && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    };
+                    return Array.from(document.querySelectorAll('input'))
+                        .filter(inp => vis(inp) && (!inp.type || inp.type === 'text'))
+                        .map((inp, i) => ({i, ph: inp.placeholder, name: inp.name, val: (inp.value||'').slice(0,20)}));
+                }""")
+                logger.warning("JetSMART checkout: visible text inputs (is_origin=%s idx=%s): %s", is_origin, idx, _all_inputs)
             except Exception:
                 pass
-            if "chrome-error://" in page.url.lower():
-                break
-            await page.wait_for_timeout(500)
+            # Focus the correct text input — prefer by placeholder, fall back to index
+            focused_by = await page.evaluate("""([idx, isOrigin]) => {
+                const vis = (el) => {
+                    const s = getComputedStyle(el);
+                    return s.display !== 'none' && s.visibility !== 'hidden'
+                        && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                };
+                const destPhs = ['Destino', 'Destination', 'Llegada', 'To'];
+                const origPhs = ['Origen', 'Origin', 'Salida', 'From'];
+                const phs = isOrigin ? origPhs : destPhs;
+                for (const ph of phs) {
+                    const inp = document.querySelector('input[placeholder="' + ph + '"]');
+                    if (inp && vis(inp)) { inp.focus(); inp.click(); return 'ph:' + ph; }
+                }
+                // Fallback: by index among visible text inputs
+                const inputs = Array.from(document.querySelectorAll('input'))
+                    .filter(inp => vis(inp) && (!inp.type || inp.type === 'text'));
+                if (inputs[idx]) { inputs[idx].focus(); inputs[idx].click(); return 'idx:' + idx; }
+                return false;
+            }""", [idx, is_origin])
+            logger.warning("JetSMART checkout: focused input for %s via %s", iata, focused_by)
+            await page.wait_for_timeout(1200)  # let auto-open dropdown settle
+            # NOTE: do NOT call _remove_overlays here — it destroys the CDK overlay
+            # that powers the airport autocomplete dropdown.
+            # For destination: the origin selection auto-focuses the Destino field.
+            # Avoid clicking it again (that closes the auto-opened dropdown).
+            # Just type the IATA code using keyboard — the focused input receives it.
+            if not is_origin:
+                # Check if Destino is already the active element (auto-focused after origin select)
+                _active_ph = await page.evaluate("""() => {
+                    const ae = document.activeElement;
+                    return ae ? ae.placeholder || ae.name || ae.tagName : 'none';
+                }""")
+                logger.warning("JetSMART checkout: active element before typing PMC: %s", _active_ph)
+                # If Destino isn't auto-focused, click it with force
+                if "Destino" not in str(_active_ph) and "estino" not in str(_active_ph):
+                    try:
+                        await page.locator('input[placeholder="Destino"]').first.click(force=True)
+                        await page.wait_for_timeout(400)
+                    except Exception:
+                        pass
+
+                # Debug: Check all Destino inputs (incl. hidden), Angular root context, and app-root __ngContext__
+                _dest_diag = await page.evaluate("""([iata]) => {
+                    const allDest = Array.from(document.querySelectorAll('input[placeholder="Destino"], input[placeholder="Destination"]'));
+                    const appRoot = document.querySelector('app-root');
+                    return {
+                        destInputCount: allDest.length,
+                        destInputs: allDest.map(i => ({ph: i.placeholder, vis: i.offsetHeight > 0, id: i.id, cls: i.className.slice(0,60), ngCtx: !!i.__ngContext__})),
+                        appRootNgCtx: appRoot ? (typeof appRoot.__ngContext__) : 'no_app_root',
+                        appRootCtxLen: (appRoot && Array.isArray(appRoot.__ngContext__)) ? appRoot.__ngContext__.length : -1,
+                        activeEl: document.activeElement ? (document.activeElement.placeholder || document.activeElement.tagName) : 'none',
+                    };
+                }""", [iata])
+                logger.warning("JetSMART checkout: dest diag: %s", str(_dest_diag)[:300])
+
+                # Simulate character-by-character typing via JS keyboard events (bypasses pointer blocks)
+                _js_type_result = await page.evaluate("""([iata]) => {
+                    const inp = document.querySelector('input[placeholder="Destino"]');
+                    if (!inp) return 'no_destino_input';
+                    inp.focus();
+                    // Clear existing value
+                    const nativeInputSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    nativeInputSetter.call(inp, '');
+                    inp.dispatchEvent(new Event('input', {bubbles: true}));
+                    // Type each character with full keyboard + input event sequence
+                    for (const char of iata) {
+                        const kd = new KeyboardEvent('keydown', {key: char, code: 'Key' + char, keyCode: char.charCodeAt(0), which: char.charCodeAt(0), bubbles: true, cancelable: true});
+                        inp.dispatchEvent(kd);
+                        const kp = new KeyboardEvent('keypress', {key: char, code: 'Key' + char, keyCode: char.charCodeAt(0), which: char.charCodeAt(0), charCode: char.charCodeAt(0), bubbles: true, cancelable: true});
+                        inp.dispatchEvent(kp);
+                        nativeInputSetter.call(inp, (inp.value || '') + char);
+                        const ie = new InputEvent('input', {data: char, inputType: 'insertText', bubbles: true, cancelable: false});
+                        inp.dispatchEvent(ie);
+                        const ku = new KeyboardEvent('keyup', {key: char, code: 'Key' + char, keyCode: char.charCodeAt(0), which: char.charCodeAt(0), bubbles: true, cancelable: true});
+                        inp.dispatchEvent(ku);
+                    }
+                    return 'typed:' + inp.value;
+                }""", [iata])
+                logger.warning("JetSMART checkout: JS keyboard sim result: %s", _js_type_result)
+                await asyncio.sleep(3.0)  # Give Angular time to process and render autocomplete options
+            else:
+                # For origin: use locator-based typing to reliably dispatch events
+                try:
+                    _loc = page.locator('input[placeholder="Origen"]').first
+                    await _loc.click(force=True)
+                    await _loc.select_text()
+                    await _loc.type(iata, delay=150)
+                    logger.warning("JetSMART checkout: typed %s into [placeholder=Origen]", iata)
+                except Exception as _te:
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Backspace")
+                    await page.keyboard.type(iata, delay=150)
+                    logger.warning("JetSMART checkout: typed %s via keyboard fallback (%s)", iata, str(_te)[:60])
+            # Wait up to 10s for a matching <li> to appear in the dropdown
+            try:
+                await page.wait_for_function(
+                    """(iata) => {
+                        const vis = (el) => {
+                            const s = getComputedStyle(el);
+                            return s.display !== 'none' && s.visibility !== 'hidden'
+                                && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                        };
+                        return Array.from(document.querySelectorAll('li'))
+                            .some(li => (li.textContent || '').includes(iata));
+                    }""",
+                    arg=iata,
+                    timeout=10000,
+                )
+            except Exception:
+                pass  # No dropdown appeared — will fall back to Enter
+            # Debug: log <li> items containing the IATA to diagnose dropdown content
+            try:
+                _dbg_items = await page.evaluate("""(iata) => {
+                    return Array.from(document.querySelectorAll('li'))
+                        .filter(li => (li.textContent || '').includes(iata))
+                        .slice(0, 8)
+                        .map(li => (li.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 80));
+                }""", iata)
+                logger.warning("JetSMART checkout: <li> items with '%s': %s", iata, _dbg_items)
+            except Exception:
+                pass
+            # Click the closest matching <li> (no visibility guard — force-click even if hidden)
+            clicked = await page.evaluate("""([iata, idx]) => {
+                const vis = (el) => {
+                    const s = getComputedStyle(el);
+                    return s.display !== 'none' && s.visibility !== 'hidden'
+                        && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                };
+                const inputs = Array.from(document.querySelectorAll('input'))
+                    .filter(inp => vis(inp) && (!inp.type || inp.type === 'text'));
+                const target = inputs[idx];
+                const tRect = target ? target.getBoundingClientRect() : null;
+                const items = Array.from(document.querySelectorAll('li'))
+                    .filter(li => (li.textContent || '').includes(iata))
+                    .sort((a, b) => {
+                        if (!tRect) return 0;
+                        const ar = a.getBoundingClientRect(), br = b.getBoundingClientRect();
+                        return (Math.abs(ar.top - tRect.bottom) + Math.abs(ar.left - tRect.left))
+                             - (Math.abs(br.top - tRect.bottom) + Math.abs(br.left - tRect.left));
+                    });
+                for (const item of items) { item.click(); return (item.textContent || '').trim().slice(0, 80); }
+                return false;
+            }""", [iata, idx])
+            if clicked:
+                logger.warning("JetSMART checkout: airport %s selected via dropdown: %s", iata, clicked)
+                await page.wait_for_timeout(800)
+                return True
+            # Fallback: Enter key
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(600)
+            logger.warning("JetSMART checkout: airport %s — pressed Enter (no dropdown)", iata)
+            return True
+
+        if not await _robust_fill_airport(origin, True):
+            logger.warning("JetSMART checkout: could not fill origin %s", origin)
+            return False
+
+        _js_city_map = {
+            "SCL": "Santiago", "IQQ": "Iquique", "ANF": "Antofagasta", "CJC": "Calama",
+            "PMC": "Puerto Montt", "CCP": "Concepcion", "ZCO": "Temuco", "ARI": "Arica",
+            "LSC": "La Serena", "ZOS": "Osorno", "ZAL": "Valdivia",
+            "LIM": "Lima", "CUZ": "Cusco", "AQP": "Arequipa",
+            "EZE": "Buenos Aires", "AEP": "Buenos Aires", "COR": "Cordoba",
+            "MDZ": "Mendoza", "IGR": "Iguazu", "NQN": "Neuquen", "USH": "Ushuaia",
+            "ROS": "Rosario", "BRC": "Bariloche", "SLA": "Salta",
+            "BOG": "Bogota", "MDE": "Medellin", "CTG": "Cartagena", "CLO": "Cali",
+        }
+        _dest_city = _js_city_map.get(destination, destination)
+
+        # ── Destination fill ─────────────────────────────────────────────
+        # Delegate to _fill_airport (same logic as search connector):
+        # focus → remove promo overlay → type IATA → click visible cursor-pointer li
+        await page.wait_for_timeout(800)
+        _dest_ok = await helper._fill_airport(page, destination, is_origin=False)
+        logger.warning("JetSMART checkout: dest _fill_airport result: %s", _dest_ok)
+
+        # Wait 1.5s for calendar to auto-open after destination selection (same as search connector)
+        await page.wait_for_timeout(1500)
+
+        # Verify destination value
+        _dest_val = await page.evaluate("""() => {
+            return (document.querySelector('input[placeholder="Destino"]') || {}).value || '';
+        }""")
+        logger.warning("JetSMART checkout: destino after _fill_airport: %s", _dest_val)
+
+        # Fill departure date — _fill_date will open calendar if not already open
+        import types as _types
+        _req_mock = _types.SimpleNamespace(date_from=target_date)
+        # Log calendar state (diagnostic only — do NOT remove overlays here)
+        _cal_state = await page.evaluate("""() => {
+            const allDD = Array.from(document.querySelectorAll('div[class*="z-[9999]"]'));
+            const cal = allDD.find(dd => Array.from(dd.querySelectorAll('div')).some(
+                d => d.children.length === 0 && d.offsetHeight > 0 && /^[0-9]{1,2}$/.test(d.textContent.trim())
+            ));
+            if (!cal) {
+                // Also check if there's any overlay at all
+                return 'not_open (overlays=' + allDD.length + ' text=' + (allDD[0] ? (allDD[0].innerText||'').slice(0,40) : 'none') + ')';
+            }
+            return 'open:' + (cal.innerText || '').replace(/\s+/g,' ').trim().slice(0, 60);
+        }""")
+        logger.warning("JetSMART checkout: calendar state before _fill_date: %s", _cal_state)
+        _date_ok = await helper._fill_date(page, _req_mock)
+
+        logger.warning("JetSMART checkout: date %s fill result: %s", departure_date, _date_ok)
+        if not _date_ok:
+            logger.warning("JetSMART checkout: could not select departure date %s", departure_date)
+            return False
+        await asyncio.sleep(0.5)
+
+        # Log form state before search
+        try:
+            _form_state = await page.evaluate("""() => {
+                const vis = (el) => !!(el.offsetWidth || el.offsetHeight);
+                return Array.from(document.querySelectorAll('input'))
+                    .filter(inp => vis(inp) && (!inp.type || inp.type === 'text'))
+                    .map(inp => ({ph: inp.placeholder, val: (inp.value||'').slice(0, 30)}));
+            }""")
+            logger.warning("JetSMART checkout: form state before search: %s", _form_state)
+        except Exception:
+            pass
+
+        await helper._click_search(page)
+        # Confirm the navigation to booking.jetsmart.com started; retry if not
+        booking_nav_started = False
+        try:
+            await page.wait_for_url("**/V2/Flight**", timeout=10000)
+            booking_nav_started = True
+        except Exception:
+            pass
+        logger.warning("JetSMART checkout: after search click, url=%s booking_nav_started=%s", page.url[:100], booking_nav_started)
+        if not booking_nav_started:
+            # Retry with broader search button click
+            try:
+                await page.evaluate("""() => {
+                    for (const el of document.querySelectorAll('div, button')) {
+                        const cls = el.className || '';
+                        if (!cls.includes('cursor-pointer') && el.tagName !== 'BUTTON') continue;
+                        const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        if ((text.includes('buscar') || text.includes('search')) && text.length < 30) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 60 && rect.height > 30) {
+                                el.click();
+                                return text;
+                            }
+                        }
+                    }
+                    return null;
+                }""")
+            except Exception:
+                pass
+            await page.wait_for_timeout(3000)
+
+        if await _wait_for_cards(45):
+            return True
 
         logger.warning("JetSMART checkout: homepage replay did not surface results (url=%s)", page.url[:120])
         return False
 
     async def _jetsmart_checkout(self, page, config, offer, offer_id, booking_url, passengers, t0):
-        if await self._prepare_jetsmart_checkout_results(page, config, offer):
-            return "prepared"
-        return None
+        """JetSMART full checkout: Vuelo→Equipaje→Asientos→Extras→Pasajeros→Pago."""
+        pax = passengers[0] if passengers else FAKE_PASSENGER
+        step = "started"
+        captured_details: dict = {}
+        # Ensure viewport is wide enough for md: breakpoint (Continuar button uses md:flex)
+        try:
+            await page.set_viewport_size({"width": 1280, "height": 800})
+        except Exception:
+            pass
+
+        # ── Step 1: Navigate & get flight results ────────────────────────
+        if not await self._prepare_jetsmart_checkout_results(page, config, offer):
+            elapsed = time.monotonic() - t0
+            return CheckoutProgress(
+                status="error",
+                step=step,
+                airline=config.airline_name,
+                source=config.source_tag,
+                offer_id=offer_id,
+                booking_url=booking_url,
+                message="JetSMART checkout: could not load flight selection page",
+                elapsed_seconds=elapsed,
+                details=captured_details,
+            )
+        step = "flights_loaded"
+
+        # ── Step 2: Click "Tarifa desde" (blue regular fare, not Club) ───
+        # The button cell has class including 'text-n-blue', 'border-l', 'cursor-pointer'
+        try:
+            clicked_tarifa = await page.evaluate("""() => {
+                for (const el of document.querySelectorAll('div')) {
+                    const cls = el.className || '';
+                    if (!cls.includes('border-l') || !cls.includes('cursor-pointer')) continue;
+                    const text = (el.innerText || el.textContent || '').trim();
+                    if (text.startsWith('Tarifa desde') || (text.includes('Tarifa desde') && !text.includes('Club'))) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+        except Exception:
+            clicked_tarifa = True  # context destroyed = navigation happened, treat as success
+        if not clicked_tarifa:
+            elapsed = time.monotonic() - t0
+            return CheckoutProgress(
+                status="error",
+                step=step,
+                airline=config.airline_name,
+                source=config.source_tag,
+                offer_id=offer_id,
+                booking_url=booking_url,
+                message="JetSMART checkout: could not click 'Tarifa desde' fare cell",
+                elapsed_seconds=elapsed,
+                details=captured_details,
+            )
+        await page.wait_for_timeout(2000)
+        step = "fare_panel_opened"
+
+        # ── Step 3: Click first "¡Lo quiero!" in the bundle sub-panel ────
+        # This selects the cheapest Tarifa desde bundle and enables Continuar
+        try:
+            clicked_lo_quiero = await page.evaluate("""() => {
+                for (const el of document.querySelectorAll('div')) {
+                    const text = (el.innerText || el.textContent || '').trim();
+                    if ((text === '\u00a1Lo quiero!' || text === 'Lo quiero') && (el.className || '').includes('rounded-full')) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+        except Exception:
+            clicked_lo_quiero = True  # context destroyed = navigation happened
+        if not clicked_lo_quiero:
+            try:
+                await page.locator("div[class*='rounded-full']:has-text('Lo quiero')").first.click(timeout=3000)
+                clicked_lo_quiero = True
+            except Exception:
+                pass
+        if not clicked_lo_quiero:
+            elapsed = time.monotonic() - t0
+            return CheckoutProgress(
+                status="error",
+                step=step,
+                airline=config.airline_name,
+                source=config.source_tag,
+                offer_id=offer_id,
+                booking_url=booking_url,
+                message="JetSMART checkout: could not click '¡Lo quiero!' bundle selector",
+                elapsed_seconds=elapsed,
+                details=captured_details,
+            )
+        await page.wait_for_timeout(2000)
+        # Dismiss Club JetSMART membership modal if it appeared after bundle selection
+        try:
+            await page.evaluate("""() => {
+                for (const el of document.querySelectorAll('div, button, a, span')) {
+                    const text = (el.innerText || el.textContent || '').trim();
+                    if (text === 'No quiero ser parte' || text === "I don't want to be part") {
+                        el.click(); return true;
+                    }
+                }
+                for (const el of document.querySelectorAll('div')) {
+                    const cls = el.className || '';
+                    if (cls.includes('bg-[#484848]') && cls.includes('cursor-pointer')) {
+                        el.click(); return true;
+                    }
+                }
+                return false;
+            }""")
+        except Exception:
+            pass
+        await page.wait_for_timeout(500)
+        # Close the bundle selection panel — target the bundle-panel Cerrar specifically
+        # (has class text-[#828282], distinct from the search-edit Cerrar which has font-body text-sm)
+        try:
+            cerrar_clicked = await page.evaluate("""() => {
+                // Prefer the bundle-panel close (text-[#828282] class)
+                for (const el of document.querySelectorAll('div, button, span')) {
+                    const cls = el.className || '';
+                    if (!cls.includes('cursor-pointer')) continue;
+                    if (!cls.includes('text-[#828282]')) continue;
+                    const text = (el.innerText || el.textContent || '').trim();
+                    if (text === 'Cerrar' || text.startsWith('Cerrar') || text === 'Close') {
+                        el.click();
+                        return true;
+                    }
+                }
+                // Fallback: any Cerrar
+                for (const el of document.querySelectorAll('div, button, span')) {
+                    const cls = el.className || '';
+                    if (!cls.includes('cursor-pointer')) continue;
+                    const text = (el.innerText || el.textContent || '').trim();
+                    if (text === 'Cerrar' || text.startsWith('Cerrar') || text === 'Close') {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+        except Exception:
+            cerrar_clicked = True  # context destroyed = navigation already happened
+        if not cerrar_clicked:
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+        await page.wait_for_timeout(1500)
+        step = "fare_selected"
+
+        # Helper: dismiss the Club JetSMART membership modal (appears after bundle selection or Continuar)
+        async def _dismiss_club_modal():
+            try:
+                result = await page.evaluate("""() => {
+                    // Prefer the dark X close button (bg-[#484848]) — unambiguous modal close
+                    for (const el of document.querySelectorAll('div')) {
+                        const cls = el.className || '';
+                        if (cls.includes('bg-[#484848]') && cls.includes('cursor-pointer')) {
+                            el.click();
+                            return 'close_x';
+                        }
+                    }
+                    // 'No quiero ser parte' = "I don't want to be part of Club JetSMART"
+                    for (const el of document.querySelectorAll('div, button, a, span')) {
+                        const text = (el.innerText || el.textContent || '').trim();
+                        if (text === 'No quiero ser parte' || text === "I don't want to be part") {
+                            el.click();
+                            return 'no_quiero';
+                        }
+                    }
+                    return null;
+                }""")
+                if result:
+                    # Wait for modal to fully close (bg-[#484848] X button disappears)
+                    try:
+                        await page.wait_for_function(
+                            """() => {
+                                for (const el of document.querySelectorAll('div')) {
+                                    const cls = el.className || '';
+                                    if (cls.includes('bg-[#484848]') && cls.includes('cursor-pointer')) {
+                                        const rect = el.getBoundingClientRect();
+                                        if (rect.width > 0 && rect.height > 0) return false;
+                                    }
+                                }
+                                return true;
+                            }""",
+                            timeout=3000,
+                        )
+                    except Exception:
+                        # Try Escape as additional push
+                        try:
+                            await page.keyboard.press("Escape")
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(1000)
+                    return True
+            except Exception:
+                pass
+            # Final fallback: Escape key
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(500)
+            except Exception:
+                pass
+            return False
+
+        # Helper: click the active "Continuar" button using JS .click() (bypasses display:none)
+        async def _click_continuar():
+            # Always dismiss Club modal first
+            await _dismiss_club_modal()
+            for attempt in range(8):
+                try:
+                    result = await page.evaluate("""() => {
+                        // Find the ACTIVE Continuar button: has bg-[#af272f] (red) class
+                        for (const el of document.querySelectorAll('div')) {
+                            const cls = el.className || '';
+                            if (!cls.includes('rounded-full')) continue;
+                            if (!cls.includes('bg-[#af272f]')) continue;
+                            if (cls.includes('pointer-events-none')) continue;
+                            const text = (el.innerText || el.textContent || '').trim();
+                            if (text === 'Continuar' || text.startsWith('Continuar')) {
+                                el.click();
+                                return 'clicked';
+                            }
+                        }
+                        // Fallback: any rounded-full Continuar without pointer-events-none
+                        for (const el of document.querySelectorAll('div')) {
+                            const cls = el.className || '';
+                            if (!cls.includes('rounded-full')) continue;
+                            if (cls.includes('pointer-events-none')) continue;
+                            const text = (el.innerText || el.textContent || '').trim();
+                            if (text === 'Continuar' || text.startsWith('Continuar')) {
+                                el.click();
+                                return 'fallback';
+                            }
+                        }
+                        // Broad: any button/div with Continuar text that is clickable
+                        for (const el of document.querySelectorAll('button, div, a')) {
+                            const text = (el.innerText || el.textContent || '').trim();
+                            if (text !== 'Continuar') continue;
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                el.click();
+                                return 'broad';
+                            }
+                        }
+                        return null;
+                    }""")
+                    if result:
+                        await page.wait_for_timeout(2500)
+                        return True
+                except Exception:
+                    pass  # context destroyed = navigation happened, treat as success
+                    await page.wait_for_timeout(500)
+                    return True
+                await page.wait_for_timeout(1000)
+            return False
+
+        # ── Steps 4-7: Vuelo→Equipaje→Asientos→Extras→Pasajeros ─────────
+        # JetSMART is a SPA — URL never changes between steps, so we detect progress by
+        # waiting for "Selecciona el Vuelo" to disappear (means we left the Vuelo step)
+        # and then clicking Continuar for each subsequent step.
+        jetsmart_steps = ["equipaje", "asientos", "extras", "pasajeros"]
+        for step_label in jetsmart_steps:
+            logger.debug("JetSMART: clicking Continuar for step '%s'", step_label)
+            # Dismiss any Club modal before clicking Continuar
+            await _dismiss_club_modal()
+            advanced = await _click_continuar()
+            # After advancing from Vuelo, wait for flight-selection content to clear
+            if step_label == "equipaje":
+                try:
+                    await page.wait_for_function(
+                        """() => !document.body.innerText.includes('Selecciona el Vuelo')""",
+                        timeout=8000,
+                    )
+                except Exception:
+                    pass  # proceed anyway
+            await page.wait_for_timeout(1500)
+            logger.debug("JetSMART step %s: advanced=%s url=%s", step_label, advanced, page.url[-60:])
+        step = "continued_to_pasajeros"
+
+        # ── Step 8: Fill Pasajeros form ───────────────────────────────────
+        await page.wait_for_timeout(2000)
+        given_name = str(pax.get("given_name") or "Test")
+        family_name = str(pax.get("family_name") or "Traveler")
+        email_val = "test@example.com"
+        for sel, val in [
+            ("input[placeholder*='ombre'], input[name*='ombre'], input[name*='first']", given_name),
+            ("input[placeholder*='pellido'], input[name*='pellido'], input[name*='last']", family_name),
+            ("input[type='email'], input[placeholder*='mail']", email_val),
+        ]:
+            try:
+                el = page.locator(sel).first
+                if await el.count() > 0 and await el.is_visible(timeout=1000):
+                    await el.fill(val)
+            except Exception:
+                pass
+        await page.wait_for_timeout(500)
+
+        # ── Step 9: Continuar to Pago ─────────────────────────────────────
+        await _click_continuar()
+        await page.wait_for_timeout(3000)
+        step = "passengers_filled"
+
+        # ── Step 10: Extract details and return ───────────────────────────
+        screenshot = await take_screenshot_b64(page)
+        try:
+            captured_details = self._merge_checkout_details(
+                captured_details,
+                await self._extract_generic_visible_checkout_details(page, config, default_currency=offer.get("currency", "PEN")),
+            )
+        except Exception:
+            pass
+        final_snapshot = await self._snapshot_checkout_page(page)
+        final_page = self._infer_checkout_page(captured_details, final_snapshot)
+        if final_page:
+            captured_details["checkout_page"] = final_page
+        elapsed = time.monotonic() - t0
+        page_price = float(offer.get("price", 0.0) or 0.0)
+        display_total = captured_details.get("display_total")
+        if isinstance(display_total, dict) and isinstance(display_total.get("amount"), (int, float)):
+            page_price = float(display_total["amount"])
+
+        if final_page == "payment":
+            return CheckoutProgress(
+                status="payment_page_reached",
+                step="payment_page_reached",
+                step_index=8,
+                airline=config.airline_name,
+                source=config.source_tag,
+                offer_id=offer_id,
+                total_price=page_price,
+                currency=offer.get("currency", "PEN"),
+                booking_url=page.url or booking_url,
+                screenshot_b64=screenshot,
+                message=f"JetSMART checkout reached payment in {elapsed:.0f}s. Price: {page_price} {offer.get('currency', 'PEN')}.",
+                can_complete_manually=True,
+                elapsed_seconds=elapsed,
+                details=captured_details,
+            )
+        return CheckoutProgress(
+            status="in_progress",
+            step=step,
+            step_index=CHECKOUT_STEPS.index(step) if step in CHECKOUT_STEPS else 0,
+            airline=config.airline_name,
+            source=config.source_tag,
+            offer_id=offer_id,
+            total_price=page_price,
+            currency=offer.get("currency", "PEN"),
+            booking_url=final_snapshot.get("current_url") or page.url or booking_url,
+            screenshot_b64=screenshot,
+            message=(
+                f"JetSMART checkout reached '{step}'. Surface: '{final_page or 'unknown'}'. "
+                f"Price: {page_price} {offer.get('currency', 'PEN')}."
+            ),
+            can_complete_manually=True,
+            elapsed_seconds=elapsed,
+            details=self._merge_checkout_details(captured_details, {
+                "blocker": "payment_page_not_reached",
+                "checkout_page": final_page or "unknown",
+                "current_url": final_snapshot.get("current_url") or page.url or booking_url,
+            }),
+        )
 
     async def _prepare_volaris_checkout_results(self, page, offer: dict) -> None:
         try:

@@ -27,6 +27,7 @@ import httpx
 from .combo_engine import build_combos
 from .currency import fetch_rates, _fallback_convert
 from .airline_routes import get_country, get_relevant_connectors, AIRLINE_COUNTRIES
+from .ancillary_ref import get_ancillary_ref
 from .browser import is_browser_available
 from .ryanair import RyanairConnectorClient
 from .wizzair import WizzairConnectorClient
@@ -220,6 +221,7 @@ from .byojet import ByojetConnectorClient
 from .yatra import YatraConnectorClient
 from .etraveli import EtraveliConnectorClient, TravelgenioConnectorClient
 from .ixigo import IxigoConnectorClient
+from .easemytrip import EasemytripConnectorClient
 from .rehlat import RehlatConnectorClient
 from .travelstart import TravelstartConnectorClient
 from .auntbetty import AuntbettyConnectorClient
@@ -236,6 +238,8 @@ from .hopper import HopperConnectorClient
 from .esky import EskyConnectorClient
 from .hkexpress import HKExpressConnectorClient
 from .aircairo import AirCairoConnectorClient
+from .allianceair import AllianceAirConnectorClient
+from .starair import StarAirConnectorClient
 
 from ..models.flights import AirlineSummary, FlightOffer, FlightSearchRequest, FlightSearchResponse
 
@@ -390,7 +394,7 @@ _FAST_MODE_SOURCES: set[str] = {
     "travelstart_ota", "travix_ota", "travelup_ota", "lastminute_ota", "byojet_ota",
     "yatra_ota", "auntbetty_ota", "flightcatchers_ota", "traveltrolley_ota",
     "almosafer_ota", "bookingcom_ota", "musafir_ota", "akbartravels_ota",
-    "airasiamove_ota", "esky_ota",
+    "airasiamove_ota", "esky_ota", "easemytrip_ota",
     # ── Meta-search aggregators ──
     "wego_meta", "momondo_meta", "kayak_meta", "cheapflights_meta", "skyscanner_meta",
     "aviasales_meta", "agoda_meta", "ixigo_meta", "skiplagged_meta",
@@ -398,6 +402,9 @@ _FAST_MODE_SOURCES: set[str] = {
     "ryanair_direct", "wizzair_direct", "easyjet_direct", "southwest_direct",
     "spirit_direct", "frontier_direct", "allegiant_direct", "jetblue_direct",
     "vueling_direct", "norwegian_direct", "transavia_direct",
+    # ── India domestic/international LCCs ──
+    "indigo_direct", "spicejet_direct", "akasa_direct", "airindiaexpress_direct",
+    "allianceair_direct", "starair_direct",
     # ── Key full-service carriers (high user demand) ──
     "emirates_direct", "turkish_direct", "finnair_direct",
     # ── Kiwi is always included (global aggregator) ──
@@ -417,7 +424,7 @@ _ECONOMY_ONLY_SOURCES: set[str] = {
     "flyadeal_direct", "airarabia_direct", "salamair_direct",
     "indigo_direct", "spicejet_direct", "akasa_direct",
     "cebupacific_direct", "nokair_direct", "citilink_direct",
-    "airindiaexpress_direct", "peach_direct",
+    "airindiaexpress_direct", "allianceair_direct", "starair_direct", "peach_direct",
     "spring_direct", "9air_direct", "luckyair_direct",
     "superairjet_direct", "transnusa_direct",
     "transavia_direct", "level_direct", "volotea_direct",
@@ -735,6 +742,9 @@ _DIRECT_AIRLINE_connectorS: list[tuple[str, type, float]] = [
     ("esky_ota", EskyConnectorClient, 55.0),
     ("hkexpress_direct", HKExpressConnectorClient, 25.0),
     ("aircairo_direct", AirCairoConnectorClient, 45.0),
+    ("allianceair_direct", AllianceAirConnectorClient, 35.0),
+    ("starair_direct", StarAirConnectorClient, 35.0),
+    ("easemytrip_ota", EasemytripConnectorClient, 35.0),
 ]
 
 
@@ -1297,6 +1307,12 @@ class MultiProvider:
 
         # Normalize prices to requested currency for fair comparison
         await self._normalize_prices(all_offers, req.currency)
+
+        # ── Ancillary enrichment ───────────────────────────────────────────
+        # Fill in bags_price (and seat pricing in conditions) for any offer
+        # that didn't receive live ancillary data from its connector.  Uses
+        # the central reference table keyed by IATA carrier code.
+        self._enrich_ancillaries(all_offers)
 
         # ── Pipeline diagnostics: log per-source offer counts ──────────────
         self._log_pipeline_stage("collected (pre-filter)", all_offers)
@@ -2157,6 +2173,100 @@ class MultiProvider:
                     offer.price_normalized = offer.price * rates[target]
                 else:
                     offer.price_normalized = _fallback_convert(offer.price, src, target)
+
+    @staticmethod
+    def _enrich_ancillaries(offers: list[FlightOffer]) -> None:
+        """Populate bags_price (and conditions text) for every offer.
+
+        Only fills in reference data for offers whose connector did NOT already
+        set bags_price (i.e. bags_price is empty).  Connectors that extract
+        live ancillary prices from their APIs are never overwritten.
+
+        Uses the central ``ancillary_ref._AIRLINE_ANCILLARY`` lookup table
+        keyed by IATA carrier code.  Prices in ref are in the airline's
+        native currency; only 0.0 ("included") is currency-agnostic.
+        """
+        for offer in offers:
+            # Skip if connector already populated live ancillary data
+            if offer.bags_price:
+                continue
+
+            # Determine the operating carrier
+            iata = offer.owner_airline or (offer.airlines[0] if offer.airlines else "")
+            if not iata:
+                continue
+
+            ref = get_ancillary_ref(iata)
+            if not ref:
+                continue
+
+            ref_currency = ref.get("currency", "")
+            currency_matches = (
+                not ref_currency
+                or ref_currency.upper() == offer.currency.upper()
+            )
+
+            # --- carry_on bags_price (only write when currency matches or included) ---
+            carry_on = ref.get("carry_on")
+            if carry_on is not None:
+                if carry_on == 0.0 or currency_matches:
+                    offer.bags_price["carry_on"] = carry_on
+
+            # --- checked_bag bags_price ---
+            checked_bag = ref.get("checked_bag")
+            if checked_bag is not None:
+                if checked_bag == 0.0 or currency_matches:
+                    offer.bags_price["checked_bag"] = checked_bag
+
+            # --- Generate conditions text ---
+            def _carry_on_text() -> str | None:
+                # Use verbatim note if provided
+                note = ref.get("carry_on_note")
+                if note:
+                    return note
+                if carry_on is None:
+                    return None
+                kg = ref.get("carry_on_kg")
+                kg_str = f" ({kg} kg)" if kg is not None else ""
+                if carry_on == 0.0:
+                    return f"1 cabin bag included{kg_str}"
+                if currency_matches:
+                    return f"from ~{ref_currency} {carry_on:.0f}{kg_str}"
+                return None
+
+            def _checked_bag_text() -> str | None:
+                note = ref.get("checked_bag_note")
+                if note:
+                    return note
+                if checked_bag is None:
+                    return None
+                kg = ref.get("checked_bag_kg")
+                kg_str = f" ({kg} kg)" if kg is not None else ""
+                if checked_bag == 0.0:
+                    return f"1 checked bag included{kg_str}"
+                if currency_matches:
+                    return f"from ~{ref_currency} {checked_bag:.0f}{kg_str}"
+                return None
+
+            if "carry_on" not in offer.conditions:
+                text = _carry_on_text()
+                if text:
+                    offer.conditions["carry_on"] = text
+
+            if "checked_bag" not in offer.conditions:
+                text = _checked_bag_text()
+                if text:
+                    offer.conditions["checked_bag"] = text
+
+            # --- Seat pricing ---
+            seat = ref.get("seat")
+            if "seat_from" not in offer.conditions and seat is not None:
+                if seat == 0.0:
+                    offer.conditions["seat_from"] = "included"
+                elif currency_matches:
+                    offer.conditions["seat_from"] = (
+                        f"from ~{ref_currency} {seat:.0f}"
+                    )
 
     def _diverse_select(
         self, offers: list[FlightOffer], sort: str, limit: int
