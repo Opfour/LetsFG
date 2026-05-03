@@ -108,8 +108,11 @@ class CleartripConnectorClient:
         currency: str,
     ) -> dict | None:
         """Fetch live bag/seat pricing for Cleartrip (OTA). Returns None - ancillary_ref.py fallback."""
-        return None
-
+        return {
+            "checked_bag_note": "baggage depends on airline – full-service carriers include 15–25 kg; LCCs charge add-on from ~INR 1,000",
+            "bags_note": "personal item / hand bag typically free; cabin bag varies by airline",
+            "seat_note": "seat selection varies by airline; skip for free random seat",
+        }
     def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
         bags_note = ancillary.get("bags_note")
         checked_note = ancillary.get("checked_bag_note")

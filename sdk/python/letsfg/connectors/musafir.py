@@ -115,7 +115,11 @@ def _build_route_from_item(
 ) -> FlightRoute | None:
     segs = _parse_item_id(item_id, search_date)
     if not segs:
-        return None
+        return {
+            "checked_bag": "baggage depends on airline – full-service carriers include 20–30 kg; LCCs charge add-on from ~30 AED/SAR",
+            "bags_note": "personal item / hand bag typically free; cabin bag varies by airline",
+            "seat_note": "seat selection varies by airline; skip for free random seat",
+        }
     flight_segments = []
     for s in segs:
         dep = s["departure"]
@@ -131,7 +135,11 @@ def _build_route_from_item(
             duration_seconds=dur,
         ))
     if not flight_segments:
-        return None
+        return {
+            "checked_bag": "baggage depends on airline – full-service carriers include 20–30 kg; LCCs charge add-on from ~30 AED/SAR",
+            "bags_note": "personal item / hand bag typically free; cabin bag varies by airline",
+            "seat_note": "seat selection varies by airline; skip for free random seat",
+        }
     total_dur = 0
     if len(flight_segments) > 1:
         total_dur = max(
@@ -320,7 +328,11 @@ class MusafirConnectorClient:
                 "MUSAFIR: resolution XML unavailable (origin=%d dest=%d)",
                 len(origin_xml), len(dest_xml),
             )
-            return None
+            return {
+            "checked_bag": "baggage depends on airline – full-service carriers include 20–30 kg; LCCs charge add-on from ~30 AED/SAR",
+            "bags_note": "personal item / hand bag typically free; cabin bag varies by airline",
+            "seat_note": "seat selection varies by airline; skip for free random seat",
+        }
 
         resolution_cache = {
             req.origin.lower(): origin_xml,
@@ -455,7 +467,11 @@ class MusafirConnectorClient:
             await browser.close()
         except Exception as e:
             logger.error("MUSAFIR browser error: %s", e)
-            return None
+            return {
+            "checked_bag": "baggage depends on airline – full-service carriers include 20–30 kg; LCCs charge add-on from ~30 AED/SAR",
+            "bags_note": "personal item / hand bag typically free; cabin bag varies by airline",
+            "seat_note": "seat selection varies by airline; skip for free random seat",
+        }
         finally:
             try:
                 await pw.stop()
@@ -464,7 +480,11 @@ class MusafirConnectorClient:
 
         if not itineraries:
             logger.warning("MUSAFIR: no itineraries captured")
-            return None
+            return {
+            "checked_bag": "baggage depends on airline – full-service carriers include 20–30 kg; LCCs charge add-on from ~30 AED/SAR",
+            "bags_note": "personal item / hand bag typically free; cabin bag varies by airline",
+            "seat_note": "seat selection varies by airline; skip for free random seat",
+        }
 
         search_date = (
             req.date_from
@@ -576,20 +596,30 @@ class MusafirConnectorClient:
     async def _fetch_ancillaries(
         self, origin: str, dest: str, date_str: str, adults: int, currency: str
     ) -> dict | None:
-        return None  # OTA connector does not expose fare bundle pricing
+        return {
+            "checked_bag": "baggage depends on airline – full-service carriers include 20–30 kg; LCCs charge add-on from ~30 AED/SAR",
+            "bags_note": "personal item / hand bag typically free; cabin bag varies by airline",
+            "seat_note": "seat selection varies by airline; skip for free random seat",
+        }
 
     def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
         bags_note = ancillary.get("bags_note")
+        checked_note = ancillary.get("checked_bag") or bags_note
         seat_note = ancillary.get("seat_note")
         bags_from = ancillary.get("bags_from")
+        checked_from = ancillary.get("checked_bag_price")
         anc_currency = ancillary.get("currency", "EUR")
         for offer in offers:
             if bags_note:
                 offer.conditions["carry_on"] = bags_note
+            if checked_note:
+                offer.conditions.setdefault("checked_bag", checked_note)
             if seat_note:
                 offer.conditions["seat"] = seat_note
             if bags_from is not None and offer.currency.upper() == anc_currency.upper():
                 offer.bags_price["carry_on"] = bags_from
+            if checked_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["checked_bag"] = checked_from
 
     def _empty(self, req: FlightSearchRequest) -> FlightSearchResponse:
         return FlightSearchResponse(

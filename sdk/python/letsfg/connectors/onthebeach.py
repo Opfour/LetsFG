@@ -479,4 +479,19 @@ class OnthebeachConnectorClient:
         adults: int,
         currency: str,
     ) -> dict | None:
-        return None
+        return {
+            "checked_bag_note": "baggage allowance varies by package – often included; check at checkout",
+            "bags_note": "hand baggage typically included; checked bag may be included in beach packages",
+            "seat_note": "seat selection add-on at checkout; skip for free random seat",
+        }
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        checked_bag_note = ancillary.get("checked_bag_note")
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        for offer in offers:
+            if checked_bag_note:
+                offer.conditions["checked_bag"] = checked_bag_note
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note

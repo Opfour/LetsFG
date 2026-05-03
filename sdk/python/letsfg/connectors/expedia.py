@@ -487,4 +487,19 @@ class ExpediaConnectorClient:
         adults: int,
         currency: str,
     ) -> dict | None:
-        return None
+        return {
+            "checked_bag_note": "baggage depends on airline and fare – may be included or add-on from ~30 USD; check at checkout",
+            "bags_note": "personal item free on most airlines; cabin bag varies by airline and fare",
+            "seat_note": "seat selection varies by airline; skip at checkout for free random seat",
+        }
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        checked_bag_note = ancillary.get("checked_bag_note")
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        for offer in offers:
+            if checked_bag_note:
+                offer.conditions["checked_bag"] = checked_bag_note
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note

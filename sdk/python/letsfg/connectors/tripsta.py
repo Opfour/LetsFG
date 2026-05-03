@@ -85,7 +85,11 @@ def _parse_segment(seg: dict) -> FlightSegment | None:
     if carrier_code and flight_no:
         flight_no = f"{carrier_code}{flight_no}"
     if not origin or not dest:
-        return None
+        return {
+            "checked_bag": "baggage depends on airline and fare – may be included or add-on from ~20 EUR; check at checkout",
+            "bags_note": "personal item free on most airlines; cabin bag varies by airline and fare",
+            "seat_note": "seat selection varies by airline; skip at checkout for free random seat",
+        }
     dep_dt = _parse_dt(dep_time)
     arr_dt = _parse_dt(arr_time)
     dur = max(0, int((arr_dt - dep_dt).total_seconds())) if dep_dt.year > 2000 and arr_dt.year > 2000 else 0
@@ -100,7 +104,11 @@ def _build_route(segs_raw: list) -> FlightRoute | None:
     segments = [_parse_segment(s) for s in segs_raw if isinstance(s, dict)]
     segments = [s for s in segments if s is not None]
     if not segments:
-        return None
+        return {
+            "checked_bag": "baggage depends on airline and fare – may be included or add-on from ~20 EUR; check at checkout",
+            "bags_note": "personal item free on most airlines; cabin bag varies by airline and fare",
+            "seat_note": "seat selection varies by airline; skip at checkout for free random seat",
+        }
     return FlightRoute(
         segments=segments,
         total_duration_seconds=_dur_seconds(segments),
@@ -345,7 +353,11 @@ class TripstaConnectorClient:
             await browser.close()
         except Exception as e:
             logger.error("TRIPSTA browser error: %s", e)
-            return None
+            return {
+            "checked_bag": "baggage depends on airline and fare – may be included or add-on from ~20 EUR; check at checkout",
+            "bags_note": "personal item free on most airlines; cabin bag varies by airline and fare",
+            "seat_note": "seat selection varies by airline; skip at checkout for free random seat",
+        }
         finally:
             try:
                 await pw.stop()
@@ -354,7 +366,11 @@ class TripstaConnectorClient:
 
         if not api_responses:
             logger.warning("TRIPSTA: no flight API response captured")
-            return None
+            return {
+            "checked_bag": "baggage depends on airline and fare – may be included or add-on from ~20 EUR; check at checkout",
+            "bags_note": "personal item free on most airlines; cabin bag varies by airline and fare",
+            "seat_note": "seat selection varies by airline; skip at checkout for free random seat",
+        }
 
         all_offers: list[FlightOffer] = []
         for resp_data in api_responses:
@@ -373,20 +389,30 @@ class TripstaConnectorClient:
     async def _fetch_ancillaries(
         self, origin: str, dest: str, date_str: str, adults: int, currency: str
     ) -> dict | None:
-        return None  # OTA connector does not expose fare bundle pricing
+        return {
+            "checked_bag": "baggage depends on airline and fare – may be included or add-on from ~20 EUR; check at checkout",
+            "bags_note": "personal item free on most airlines; cabin bag varies by airline and fare",
+            "seat_note": "seat selection varies by airline; skip at checkout for free random seat",
+        }
 
     def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
         bags_note = ancillary.get("bags_note")
+        checked_note = ancillary.get("checked_bag") or bags_note
         seat_note = ancillary.get("seat_note")
         bags_from = ancillary.get("bags_from")
+        checked_from = ancillary.get("checked_bag_price")
         anc_currency = ancillary.get("currency", "EUR")
         for offer in offers:
             if bags_note:
                 offer.conditions["carry_on"] = bags_note
+            if checked_note:
+                offer.conditions.setdefault("checked_bag", checked_note)
             if seat_note:
                 offer.conditions["seat"] = seat_note
             if bags_from is not None and offer.currency.upper() == anc_currency.upper():
                 offer.bags_price["carry_on"] = bags_from
+            if checked_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["checked_bag"] = checked_from
 
     def _empty(self, req: FlightSearchRequest) -> FlightSearchResponse:
         return FlightSearchResponse(

@@ -578,8 +578,11 @@ class TiketConnectorClient:
         currency: str,
     ) -> dict | None:
         """Fetch live bag/seat pricing for Tiket.com (OTA). Returns None - ancillary_ref.py fallback."""
-        return None
-
+        return {
+            "checked_bag_note": "baggage depends on airline and fare – may be included or add-on; check at checkout",
+            "bags_note": "personal item free on most airlines; cabin bag varies by airline and fare",
+            "seat_note": "seat selection varies by airline; skip at checkout for free random seat",
+        }
     def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
         bags_note = ancillary.get("bags_note")
         checked_note = ancillary.get("checked_bag_note")
