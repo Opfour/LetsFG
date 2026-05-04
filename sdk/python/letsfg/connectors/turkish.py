@@ -1752,7 +1752,10 @@ class TurkishConnectorClient:
                     source_tier="free",
                 ))
                 # Enrich per-offer bag conditions from fareCategory (CDP path)
-                _fare_cat = (opt.get("fareCategory") or "").upper()
+                _fare_cat_raw = opt.get("fareCategory")
+                if isinstance(_fare_cat_raw, dict):
+                    _fare_cat_raw = _fare_cat_raw.get("code") or _fare_cat_raw.get("name") or ""
+                _fare_cat = (_fare_cat_raw or "").upper()
                 if _fare_cat:
                     _o = offers[-1]
                     _o.bags_price["carry_on"] = 0.0

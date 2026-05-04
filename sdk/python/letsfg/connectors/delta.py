@@ -676,26 +676,46 @@ class DeltaConnectorClient:
     async def _fill_airport_modern(self, page, field_type: str, iata: str) -> bool:
         """Fill airport via the modern mach-route-picker component."""
         try:
-            # The modern route picker has input fields inside shadow DOM or
-            # aria-labeled inputs.  Try clicking the origin/dest area.
+            # Try multiple selector strategies — Delta redesigns frequently
+            # Strategy 1: mach-route-picker custom element (older modern form)
             if field_type == "origin":
-                inp = page.locator(
-                    "mach-route-picker input"
-                ).first
+                candidates = [
+                    page.locator("mach-route-picker input").first,
+                    page.locator("input[aria-label*='Leaving from'], input[aria-label*='From'], input[placeholder*='From']").first,
+                    page.locator("[data-test*='origin'] input, [data-testid*='origin'] input").first,
+                ]
             else:
-                inp = page.locator(
-                    "mach-route-picker input"
-                ).last
+                candidates = [
+                    page.locator("mach-route-picker input").last,
+                    page.locator("input[aria-label*='Going to'], input[aria-label*='To'], input[placeholder*='To']").first,
+                    page.locator("[data-test*='destination'] input, [data-testid*='destination'] input").first,
+                ]
 
-            await inp.click(timeout=5000)
+            inp = None
+            for candidate in candidates:
+                try:
+                    if await candidate.count() > 0 and await candidate.is_visible(timeout=2000):
+                        inp = candidate
+                        break
+                except Exception:
+                    continue
+
+            if inp is None:
+                logger.debug("Delta: modern airport '%s' — no input found with any selector", field_type)
+                return False
+
+            await inp.click(force=True, timeout=5000)
             await asyncio.sleep(0.5)
             await inp.fill("")
             await asyncio.sleep(0.2)
             await inp.press_sequentially(iata, delay=100)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.8)
 
             # Click the matching suggestion
             opt = page.locator("[role='option']").filter(has_text=iata).first
+            if await opt.count() == 0:
+                # Fallback: look for any dropdown item containing the IATA code
+                opt = page.locator("li, [role='listitem']").filter(has_text=iata).first
             await opt.click(timeout=5000)
             await asyncio.sleep(0.5)
             return True

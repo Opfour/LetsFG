@@ -571,7 +571,7 @@ class FlynasConnectorClient:
             carrier = leg.get("carrierCode") or leg.get("operatedBy") or "XY"
             if flight_no and not flight_no.startswith(("XY", "xy")):
                 flight_no = f"XY{flight_no}"
-            _xy_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
+            _xy_cabin = "economy"
             segments.append(FlightSegment(
                 airline=carrier,
                 airline_name="flynas",
@@ -585,7 +585,7 @@ class FlynasConnectorClient:
 
         if not segments:
             # Fallback: build from flight-level data
-            _xy_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
+            _xy_cabin = "economy"
             flight_no = str(flight.get("flightNumber", "")).strip()
             if flight_no and not flight_no.startswith(("XY", "xy")):
                 flight_no = f"XY{flight_no}"

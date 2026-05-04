@@ -246,7 +246,29 @@ class ITAAirwaysConnectorClient:
 
             # --- Step 2: Fill origin airport ---
             logger.info("ITA: filling origin %s", req.origin)
-            origin_inp = page.locator('input[placeholder="From"]')
+            # Try multiple selectors — ITA redesigns booking form periodically
+            _origin_selectors = [
+                'input[placeholder="From"]',
+                'input[placeholder*="From"]',
+                'input[aria-label*="From"]',
+                'input[aria-label*="Departure"]',
+                'input[aria-label*="Origin"]',
+                'input[data-testid*="origin"]',
+                'input[name*="origin"]',
+            ]
+            origin_inp = None
+            for sel in _origin_selectors:
+                loc = page.locator(sel).first
+                try:
+                    if await loc.count() > 0 and await loc.is_visible(timeout=2000):
+                        origin_inp = loc
+                        logger.info("ITA: origin input found via selector: %s", sel)
+                        break
+                except Exception:
+                    continue
+            if origin_inp is None:
+                logger.warning("ITA search error: no origin input found on page")
+                return FlightSearchResponse(offers=[], total_results=0, currency="EUR")
             await origin_inp.click(click_count=3, force=True, timeout=8000)
             await asyncio.sleep(0.2)
             await page.keyboard.press("Backspace")
@@ -265,7 +287,28 @@ class ITAAirwaysConnectorClient:
 
             # --- Step 3: Fill destination airport ---
             logger.info("ITA: filling destination %s", req.destination)
-            dest_inp = page.locator('input[placeholder="To"]')
+            _dest_selectors = [
+                'input[placeholder="To"]',
+                'input[placeholder*="To"]',
+                'input[aria-label*="To"]',
+                'input[aria-label*="Destination"]',
+                'input[aria-label*="Arrival"]',
+                'input[data-testid*="destination"]',
+                'input[name*="destination"]',
+            ]
+            dest_inp = None
+            for sel in _dest_selectors:
+                loc = page.locator(sel).first
+                try:
+                    if await loc.count() > 0 and await loc.is_visible(timeout=2000):
+                        dest_inp = loc
+                        logger.info("ITA: destination input found via selector: %s", sel)
+                        break
+                except Exception:
+                    continue
+            if dest_inp is None:
+                logger.warning("ITA search error: no destination input found on page")
+                return FlightSearchResponse(offers=[], total_results=0, currency="EUR")
             await dest_inp.click(click_count=3, force=True, timeout=8000)
             await asyncio.sleep(0.2)
             await page.keyboard.press("Backspace")
@@ -283,8 +326,8 @@ class ITAAirwaysConnectorClient:
 
             # Verify form state
             form_vals = await page.evaluate("""() => ({
-                origin: document.querySelector('input[placeholder="From"]')?.value || '',
-                dest: document.querySelector('input[placeholder="To"]')?.value || '',
+                origin: document.querySelector('input[placeholder="From"], input[aria-label*="From"], input[aria-label*="Departure"]')?.value || '',
+                dest: document.querySelector('input[placeholder="To"], input[aria-label*="To"], input[aria-label*="Destination"]')?.value || '',
             })""")
             logger.info("ITA: form state: %s", form_vals)
 
