@@ -289,9 +289,9 @@ class AerolineasConnectorClient:
                 conditions={
                     "carry_on": "1 cabin bag (10 kg) + 1 personal item included",
                     "checked_bag": "1x 23kg bag included (Economy)",
-                    "seat": "seat selection from ~USD 10",
+                    "seat": "seat selection from ~USD 10 — add at checkout",
                 },
-                bags_price={"checked_bag": 0.0},
+                bags_price={"carry_on": 0.0, "checked_bag": 0.0, "seat": 10.0},
                 booking_url=booking_url,
                 is_locked=False,
                 source="aerolineas_direct",

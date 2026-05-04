@@ -760,7 +760,8 @@ class VolarisConnectorClient:
         bags_price: dict[str, float] = {}
         # Static carry-on and seat notes — overridden only if live bundle data sets them
         conditions["carry_on"] = "1 personal item (under seat) included; overhead carry-on not included on base fare"
-        conditions["seat"] = "seat selection not included on base fare; included in higher bundles"
+        conditions["seat"] = "seat selection from ~MXN 149 — not included on base fare; included in higher bundles"
+        bags_price.setdefault("seat", 149.0)  # ~MXN 149 seat selection add-on
 
         fare_family = self._extract_fare_family(selected_fare)
         if fare_family:

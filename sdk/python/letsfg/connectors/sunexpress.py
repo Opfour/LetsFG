@@ -684,6 +684,7 @@ class SunExpressConnectorClient:
         bags_note = ancillary.get("bags_note")
         seat_note = ancillary.get("seat_note")
         checked_bag_from = ancillary.get("checked_bag_from")
+        seat_from = ancillary.get("seat_from")
         anc_currency = ancillary.get("currency", "EUR")
         for offer in offers:
             if checked_bag_note:
@@ -694,6 +695,8 @@ class SunExpressConnectorClient:
                 offer.conditions["seat"] = seat_note
             if checked_bag_from == 0.0:
                 offer.bags_price["checked_bag"] = 0.0
+            if seat_from is not None:
+                offer.bags_price["seat"] = seat_from
 
     def _empty(self, req: FlightSearchRequest) -> FlightSearchResponse:
         search_hash = hashlib.md5(f"sunexpress{req.origin}{req.destination}{req.date_from}{req.return_from or ''}".encode()).hexdigest()[:12]

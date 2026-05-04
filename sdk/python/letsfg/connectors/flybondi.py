@@ -91,7 +91,59 @@ class FlybondiConnectorClient:
             if ib_result.total_results > 0:
                 ob_result.offers = self._combine_rt(ob_result.offers, ib_result.offers, req)
                 ob_result.total_results = len(ob_result.offers)
+        # Enrich all offers with probe-sourced ancillary pricing (carry-on/checked prices)
+        if ob_result.offers:
+            segs = ob_result.offers[0].outbound.segments if ob_result.offers[0].outbound else []
+            anc_origin = segs[0].origin if segs else req.origin
+            anc_dest = segs[-1].destination if segs else req.destination
+            try:
+                import asyncio as _asyncio
+                ancillary = await _asyncio.wait_for(
+                    self._fetch_ancillaries(
+                        anc_origin, anc_dest,
+                        req.date_from.isoformat(), req.adults, ob_result.currency,
+                    ),
+                    timeout=45.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(ob_result.offers, ancillary)
+            except Exception:
+                pass
         return ob_result
+
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        """Fetch bag/seat pricing via ancillary_live_probe._probe_fo (SSR HTML)."""
+        try:
+            from .ancillary_live_probe import _probe_fo
+            return await _probe_fo(origin, dest, date_str)
+        except Exception as _exc:
+            logger.debug("Flybondi ancillary probe failed: %s", _exc)
+            return None
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        checked_note = ancillary.get("checked_bag_note") or ancillary.get("checked_bag")
+        seat_note = ancillary.get("seat_note")
+        carry_on_from = ancillary.get("carry_on_from")
+        checked_from = ancillary.get("checked_bag_from")
+        seat_from = ancillary.get("seat_from")
+        for offer in offers:
+            # Only override conditions if probe gave richer data
+            if bags_note:
+                offer.conditions.setdefault("carry_on", bags_note)
+            if checked_note:
+                offer.conditions.setdefault("checked_bag", checked_note)
+            if seat_note:
+                offer.conditions.setdefault("seat", seat_note)
+            # Set numeric prices only when probe returned them
+            if carry_on_from is not None and carry_on_from > 0:
+                offer.bags_price.setdefault("carry_on", float(carry_on_from))
+            if checked_from is not None and checked_from > 0:
+                offer.bags_price.setdefault("checked_bag", float(checked_from))
+            if seat_from is not None and seat_from > 0:
+                offer.bags_price.setdefault("seat", float(seat_from))
 
 
     async def _search_ow(self, req: FlightSearchRequest) -> FlightSearchResponse:

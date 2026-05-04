@@ -23,14 +23,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ── Module-level cache ────────────────────────────────────────────────────────
-# {airline_code: (monotonic_timestamp, ancillary_dict)}
+# ── In-memory cache ───────────────────────────────────────────────────────────
+# {cache_key: (monotonic_timestamp, ancillary_dict)}
 _CACHE: Dict[str, Tuple[float, dict]] = {}
 _LOCKS: Dict[str, asyncio.Lock] = {}
 _CACHE_TTL = 12 * 3600  # 12 hours
@@ -51,6 +52,83 @@ def _get_cached(code: str) -> Optional[dict]:
 
 def _set_cache(code: str, data: dict) -> None:
     _CACHE[code] = (time.monotonic(), data)
+
+
+# ── GCS persistent cache (2nd tier) ──────────────────────────────────────────
+# Stores parsed probe results in GCS so all connector-worker instances share
+# the same data — a live browser run only happens once per 7 days per airline.
+# Path:  gs://{bucket}/ancillary-probes/{code}.json
+# Format: {"ts": <unix>, "data": {…probe result…}}
+_GCS_PROBE_BUCKET = os.environ.get("GCS_CACHE_BUCKET", "letsfg-chrome-cache")
+_GCS_PROBE_TTL = int(os.environ.get("ANCILLARY_GCS_TTL", str(7 * 24 * 3600)))  # 7 days default
+_gcs_probe_client = None  # None = uninitialised; False = unavailable
+
+# ── Airlines that MUST NOT use the GCS cache ─────────────────────────────────
+# These probes compute prices from an actual route-specific search result, so
+# the price genuinely differs per route (e.g. GOL GRU→SDU vs GRU→NAT).
+# Caching one route's result and serving it for all routes gives wrong numbers.
+# These airlines still use in-memory cache (12h per route key).
+_GCS_BYPASS_CODES: frozenset = frozenset({
+    "LA", "JJ",   # LATAM — domestic Chile vs international wildly different
+    "G3",          # GOL — BRL domestic pricing per-route
+    "AD",          # Azul — Navitaire per-route diffs
+    "Y4",          # Volaris — Navitaire per-route quote prices
+    "VB",          # VivaAerobus — returns static fallback anyway, always fast
+    "FO",          # Flybondi — ARS, curl_cffi per-route fare bundle diff
+})
+
+
+def _get_gcs_probe_client():
+    global _gcs_probe_client
+    if _gcs_probe_client is None:
+        try:
+            from google.cloud import storage  # type: ignore
+            _gcs_probe_client = storage.Client()
+        except Exception as exc:
+            logger.debug("GCS probe client unavailable: %s", exc)
+            _gcs_probe_client = False
+    return _gcs_probe_client if _gcs_probe_client is not False else None
+
+
+def _gcs_load_probe(code: str) -> Optional[dict]:
+    """Synchronous — load a probe result from GCS. Returns dict if fresh, else None."""
+    client = _get_gcs_probe_client()
+    if client is None:
+        return None
+    try:
+        bucket = client.bucket(_GCS_PROBE_BUCKET)
+        blob = bucket.blob(f"ancillary-probes/{code}.json")
+        if not blob.exists():
+            return None
+        raw = blob.download_as_bytes()
+        envelope = json.loads(raw)
+        age = time.time() - envelope.get("ts", 0)
+        if age > _GCS_PROBE_TTL:
+            logger.debug("GCS probe %s stale (%.0fh old)", code, age / 3600)
+            return None
+        logger.info("Ancillary probe %s: loaded from GCS (%.0fh old)", code, age / 3600)
+        return envelope.get("data")
+    except Exception as exc:
+        logger.debug("GCS probe load %s: %s", code, exc)
+        return None
+
+
+def _gcs_save_probe(code: str, data: dict) -> None:
+    """Synchronous — save probe result to GCS. Called in an executor (non-blocking)."""
+    client = _get_gcs_probe_client()
+    if client is None:
+        return
+    try:
+        envelope = {"ts": time.time(), "data": data}
+        bucket = client.bucket(_GCS_PROBE_BUCKET)
+        blob = bucket.blob(f"ancillary-probes/{code}.json")
+        blob.upload_from_string(
+            json.dumps(envelope, separators=(",", ":")),
+            content_type="application/json",
+        )
+        logger.debug("GCS probe saved: %s", code)
+    except Exception as exc:
+        logger.debug("GCS probe save %s: %s", code, exc)
 
 
 async def probe_ancillaries(
@@ -85,6 +163,7 @@ async def probe_ancillaries(
 
     cache_key = f"{code}:{origin}:{dest}:{month_tag}"
 
+    # ── Tier 1: in-memory ────────────────────────────────────────────────────
     cached = _get_cached(cache_key)
     if cached is not None:
         return cached
@@ -99,6 +178,18 @@ async def probe_ancillaries(
         if probe_fn is None:
             return None
 
+        # ── Tier 2: GCS persistent cache ─────────────────────────────────────
+        # Skip for dynamic per-route pricing airlines — their price depends on
+        # the actual route searched, not a representative airline-wide value.
+        gcs_eligible = code not in _GCS_BYPASS_CODES
+        if gcs_eligible:
+            gcs_data = await asyncio.get_event_loop().run_in_executor(None, _gcs_load_probe, code)
+            if gcs_data is not None:
+                _set_cache(cache_key, gcs_data)
+                return gcs_data
+
+        # ── Tier 3: live browser/API probe ────────────────────────────────────
+        loop = asyncio.get_event_loop()
         try:
             result = await asyncio.wait_for(
                 probe_fn(origin, dest, date_str, flight_no),
@@ -106,6 +197,9 @@ async def probe_ancillaries(
             )
             if result:
                 _set_cache(cache_key, result)
+                # Write to GCS in background — only for airlines with stable pricing
+                if gcs_eligible:
+                    loop.run_in_executor(None, _gcs_save_probe, code, result)
                 logger.info(
                     "Ancillary probe %s %s→%s → bag_from=%s %s (seat: %s)",
                     code,
@@ -305,6 +399,32 @@ def _fz_bag_price(data: dict) -> Optional[float]:
     except Exception:
         pass
     return None
+
+
+def _fz_extract_min_seat_price(data: dict) -> Optional[float]:
+    """Extract minimum purchasable seat add-on price from /api/v2/services/seat response.
+
+    The API returns flights[].legs[].serviceQuotes[] where each quote has:
+      - codeType: 'NSST' (standard), 'SPST' (specific std), 'FRST' (front), 'XLGR' (extra leg-room)
+      - price: string e.g. "17.00"
+      - isNonPurchasable: bool
+    """
+    try:
+        min_price: Optional[float] = None
+        for flight in (data.get("flights") or []):
+            for leg in (flight.get("legs") or []):
+                for q in (leg.get("serviceQuotes") or []):
+                    if q.get("isNonPurchasable"):
+                        continue
+                    try:
+                        p = float(q["price"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if p > 0 and (min_price is None or p < min_price):
+                        min_price = p
+        return min_price
+    except Exception:
+        return None
 
 
 def _fz_extract_brand_bag_price(data: dict) -> Optional[float]:
@@ -626,6 +746,9 @@ async def _probe_f3(
                 ]
                 if with_bag:
                     bag_price = min(f["price"] for f in with_bag)
+                    # Seat prices from GetSeatMap (probed 2026-05-03, JED→RUH):
+                    # Group 5 (exit rows) SAR 28.26, Group 6 (standard) SAR 36.74
+                    seat_min = 28.0
                     return {
                         "checked_bag_note": (
                             f"checked bag not included (fly fare) "
@@ -634,7 +757,8 @@ async def _probe_f3(
                         "bags_note": "cabin bag 7 kg included free",
                         "checked_bag_from": bag_price,
                         "currency": "SAR",
-                        "seat_note": "seat selection add-on available",
+                        "seat_from": seat_min,
+                        "seat_note": f"seat selection add-on from SAR {seat_min:.0f}",
                     }
 
             finally:
@@ -756,7 +880,9 @@ async def _probe_fz(
         from patchright.async_api import async_playwright as _patchright_playwright
 
         flights1_data: Any = None
+        seat_price_data: Any = None
         flights1_event = asyncio.Event()
+        seat_price_event = asyncio.Event()
         calendar_event_pw = asyncio.Event()
 
         _patchright_mgr = _patchright_playwright()
@@ -766,13 +892,13 @@ async def _probe_fz(
             args=[
                 "--no-first-run",
                 "--no-default-browser-check",
-                "--window-size=1366,768",
+                "--window-size=1440,900",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
             ],
         )
         context = await browser.new_context(
-            viewport={"width": 1366, "height": 768},
+            viewport={"width": 1440, "height": 900},
             locale="en-US",
             timezone_id="Asia/Dubai",
         )
@@ -780,7 +906,7 @@ async def _probe_fz(
             page = await context.new_page()
 
             async def _on_resp_fz(response):
-                nonlocal flights1_data
+                nonlocal flights1_data, seat_price_data
                 try:
                     url = response.url
                     ct = response.headers.get("content-type", "")
@@ -790,6 +916,11 @@ async def _probe_fz(
                             if d and isinstance(d, dict) and d.get("segments"):
                                 flights1_data = d
                                 flights1_event.set()
+                        elif "/api/v2/services/seat/" in url:
+                            d = await response.json()
+                            if d and isinstance(d, dict) and d.get("flights"):
+                                seat_price_data = d
+                                seat_price_event.set()
                         elif "/api/flights/7" in url or "/api/flights/" in url:
                             calendar_event_pw.set()
                 except Exception:
@@ -814,6 +945,49 @@ async def _probe_fz(
                     await asyncio.wait_for(calendar_event_pw.wait(), timeout=10.0)
                 except (asyncio.TimeoutError, TimeoutError):
                     pass
+
+            # If we got flights/1 data, continue navigation to capture seat prices
+            if flights1_data:
+                # Accept cookie banner if present
+                try:
+                    await page.locator(".osano-cm-accept-all").click(timeout=3_000)
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+
+                # Expand the first flight's fare panel (coordinate proven from discovery)
+                await page.mouse.click(952, 636)
+                await asyncio.sleep(3)  # Angular needs ~2-3s to render fare tier buttons
+
+                # Click the LITE SELECT button (first/leftmost column)
+                try:
+                    await page.locator("[class*='lite' i] button").first.click(timeout=5_000)
+                except Exception:
+                    # Fallback: click at LITE column coordinate (282,643) proven in discovery
+                    await page.mouse.click(312, 653)
+
+                # Wait for /optional page
+                try:
+                    await page.wait_for_url("**/optional/**", timeout=15_000)
+                except Exception:
+                    pass
+
+                # Click "Continue to seat selection" which triggers the seat API
+                try:
+                    await (
+                        page.locator("button")
+                        .filter(has_text="Continue to seat selection")
+                        .click(timeout=8_000)
+                    )
+                except Exception:
+                    pass
+
+                # Wait for seat price API response
+                try:
+                    await asyncio.wait_for(seat_price_event.wait(), timeout=15.0)
+                except (asyncio.TimeoutError, TimeoutError):
+                    pass
+
         finally:
             await context.close()
             await browser.close()
@@ -822,6 +996,7 @@ async def _probe_fz(
         if flights1_data:
             bag_price = _fz_extract_brand_bag_price(flights1_data)
             if bag_price:
+                min_seat = _fz_extract_min_seat_price(seat_price_data) if seat_price_data else None
                 return {
                     "checked_bag_note": (
                         f"checked bag not included (LITE fare) "
@@ -830,7 +1005,14 @@ async def _probe_fz(
                     "bags_note": "cabin bag 7 kg included free (LITE fare)",
                     "checked_bag_from": bag_price,
                     "currency": "AED",
-                    "seat_note": "seat selection add-on available",
+                    "seat_note": (
+                        f"seat selection add-on from AED {min_seat:.0f}"
+                        if min_seat
+                        else "seat selection add-on available"
+                    ),
+                    **(  # include seat_from only when we have a real price
+                        {"seat_from": min_seat} if min_seat else {}
+                    ),
                 }
     except Exception as exc:
         logger.debug("FZ flights1 browser probe error: %s", exc)
@@ -978,6 +1160,8 @@ async def _probe_xq(
             if seat_prices
             else "seat selection add-on available"
         )
+        if seat_prices:
+            result["seat_from"] = min(seat_prices)
         return result
 
     logger.debug("XQ probe: no bag prices captured for %s→%s", probe_origin, probe_dest)
@@ -1523,6 +1707,1239 @@ async def _probe_la(
         if seat_prices
         else "seat selection available"
     )
+    if seat_prices:
+        result["seat_from"] = min(seat_prices)
+    return result
+
+
+# ── Y4 — Volaris ──────────────────────────────────────────────────────────────
+
+def _y4_prices_from_quote(quote_data: dict) -> dict:
+    """Extract bag/seat add-on prices from Volaris booking/quote response.
+
+    booking/quote.breakdown.passengerTotals.specialServices.charges is a flat
+    list of {code, detail, amount, currencyCode} entries — one per SSR type —
+    followed by an MO (Mexico route surcharge) entry for that SSR.  We parse
+    only the base SSR amounts (not the MO surcharge entries).
+
+    Carry-on SSRs : CRB1 (1st carry-on), CRRB (carry-on bundle)
+    Checked SSRs  : BGB1 (1st bag), BGBN (extra bag), BB15 (15 kg bag)
+    Seat SSRs     : MOSP (More Speed pack — cheapest seat-related add-on)
+    """
+    _CARRY_ON = {"CRB1", "CRRB"}
+    _CHECKED  = {"BGB1", "BGBN", "BB15"}
+    _SEAT     = {"MOSP"}
+
+    carry_on_prices: List[float] = []
+    checked_prices: List[float] = []
+    seat_prices: List[float] = []
+    currency = "MXN"
+
+    try:
+        charges = (
+            (quote_data.get("breakdown") or {})
+            .get("passengerTotals", {})
+            .get("specialServices", {})
+            .get("charges") or []
+        )
+        for c in charges:
+            code = (c.get("code") or "").upper().strip()
+            if code == "MO":  # route surcharge — skip
+                continue
+            try:
+                amount = float(c.get("amount") or 0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            if amount <= 0:
+                continue
+            cur = c.get("currencyCode") or currency
+            currency = cur
+            if code in _CARRY_ON:
+                carry_on_prices.append(amount)
+            elif code in _CHECKED:
+                checked_prices.append(amount)
+            elif code in _SEAT:
+                seat_prices.append(amount)
+    except Exception:
+        pass
+
+    return {
+        "carry_on": carry_on_prices,
+        "checked": checked_prices,
+        "seats": seat_prices,
+        "currency": currency,
+    }
+
+
+async def _probe_y4(
+    origin: str,
+    dest: str,
+    date_str: Optional[str] = None,
+    flight_no: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Volaris (Y4) — Navitaire-based Angular SPA (apigw.volaris.com).
+
+    Flow confirmed from _disco_volaris.py live capture 2026-05-03 (MEX→CUN):
+      1. Navigate directly to /flight/select?... URL (skips homepage form)
+      2. Wait for v3/availability/search to confirm results loaded
+      3. Dismiss cookie banner (Aceptar cookies)
+      4. Click a.panel-open → expand fare family panel for first flight
+      5. Click .btn-select → FareBenefitsUpgradeModal appears
+      6. Click "Mantener Zero" in modal → booking/quote fires (200 OK)
+      7. Parse booking/quote breakdown.passengerTotals.specialServices.charges
+         for carry-on (CRB1/CRRB) and checked-bag (BGB1/BGBN) prices
+
+    The booking/quote response contains a full pre-computed SSR price catalogue
+    for the specific route.  No further checkout navigation is required.
+    Currency is always MXN (es-MX locale session).
+    """
+    from datetime import date as _date_cls
+    from patchright.async_api import async_playwright as _patchright_playwright
+    from .browser import find_chrome
+
+    probe_origin = origin if (origin and len(origin) == 3) else "MEX"
+    probe_dest = dest if (dest and len(dest) == 3 and dest != probe_origin) else "CUN"
+    if probe_dest == probe_origin:
+        probe_dest = "CUN"
+
+    dep = _probe_date(date_str, weeks_ahead=6)
+    dep_dt = _date_cls.fromisoformat(dep)
+    dep_url_date = f"{dep_dt.month:02d}/{dep_dt.day:02d}/{dep_dt.year}"
+
+    search_url = (
+        f"https://www.volaris.com/flight/select"
+        f"?culture=es-mx&promocode="
+        f"&o1={probe_origin}&d1={probe_dest}"
+        f"&dd1={dep_url_date}"
+        f"&adt=1&ch=0&inf=0&trip=OW"
+    )
+
+    quote_prices: dict = {}
+    avail_event = asyncio.Event()
+    quote_event = asyncio.Event()
+
+    chrome_path: Optional[str] = None
+    try:
+        chrome_path = find_chrome()
+    except RuntimeError:
+        pass
+
+    try:
+        async with _patchright_playwright() as pw:
+            launch_kwargs: dict = {
+                "headless": False,
+                "args": [
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--window-size=1440,900",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            }
+            if chrome_path:
+                launch_kwargs["executable_path"] = chrome_path
+            browser = await pw.chromium.launch(**launch_kwargs)
+            ctx = await browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                locale="es-MX",
+                timezone_id="America/Mexico_City",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/135.0.0.0 Safari/537.36"
+                ),
+            )
+            page = await ctx.new_page()
+
+            async def _on_resp(resp) -> None:
+                nonlocal quote_prices
+                if resp.status != 200:
+                    return
+                ct = resp.headers.get("content-type", "")
+                if "json" not in ct:
+                    return
+                url = resp.url
+                try:
+                    if "/api/v3/availability/search" in url:
+                        avail_event.set()
+                    elif "/api/booking/quote" in url:
+                        data = await resp.json()
+                        if isinstance(data, dict):
+                            parsed = _y4_prices_from_quote(data)
+                            if parsed.get("carry_on") or parsed.get("checked"):
+                                quote_prices = parsed
+                                quote_event.set()
+                except Exception:
+                    pass
+
+            page.on("response", _on_resp)
+
+            logger.debug("Y4 probe: goto %s", search_url[:120])
+            try:
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+            except Exception as exc:
+                logger.debug("Y4 goto search: %s", exc)
+
+            # Wait for availability API (up to 35 s — Angular SPA boot + search)
+            try:
+                await asyncio.wait_for(avail_event.wait(), timeout=35.0)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("Y4 probe: availability timed out for %s→%s", probe_origin, probe_dest)
+                await browser.close()
+                return None
+
+            await asyncio.sleep(4)  # allow Angular to render results
+
+            # Dismiss cookie banner if present
+            for ck_sel in [
+                "button:has-text('Aceptar cookies')",
+                "button:has-text('Aceptar')",
+            ]:
+                try:
+                    ck = page.locator(ck_sel).first
+                    if await ck.count() > 0 and await ck.is_visible(timeout=600):
+                        await ck.click(timeout=2000)
+                        await asyncio.sleep(0.5)
+                        break
+                except Exception:
+                    pass
+
+            # Expand fare panel for first flight
+            try:
+                panel = page.locator("a.panel-open").first
+                if await panel.count() == 0:
+                    logger.debug("Y4 probe: no panel-open for %s→%s", probe_origin, probe_dest)
+                    await browser.close()
+                    return None
+                await panel.click(timeout=5000)
+                await asyncio.sleep(2)
+            except Exception as exc:
+                logger.debug("Y4 probe: panel-open click: %s", exc)
+                await browser.close()
+                return None
+
+            # Click Zero fare select button
+            try:
+                btn = page.locator(".btn-select").first
+                await btn.wait_for(state="visible", timeout=8000)
+                await btn.click(timeout=5000)
+                await asyncio.sleep(2)
+            except Exception as exc:
+                logger.debug("Y4 probe: btn-select: %s", exc)
+                await browser.close()
+                return None
+
+            # Handle FareBenefitsUpgradeModal → click "Mantener Zero"
+            try:
+                for _ in range(6):
+                    await asyncio.sleep(1)
+                    modal_btns = await page.locator("mat-dialog-actions button").all()
+                    for mb in modal_btns:
+                        txt = (await mb.inner_text()).strip()
+                        if "Mantener" in txt:
+                            await mb.click()
+                            logger.debug("Y4 probe: Mantener clicked")
+                            break
+                    else:
+                        continue
+                    break
+            except Exception as exc:
+                logger.debug("Y4 probe: modal click: %s", exc)
+
+            # Wait for booking/quote API response
+            try:
+                await asyncio.wait_for(quote_event.wait(), timeout=15.0)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("Y4 probe: quote timed out for %s→%s", probe_origin, probe_dest)
+
+            await browser.close()
+
+    except Exception as exc:
+        logger.debug("Y4 Playwright probe error: %s", exc)
+
+    if not quote_prices:
+        logger.debug("Y4 probe: no prices captured for %s→%s", probe_origin, probe_dest)
+        return None
+
+    carry_on = quote_prices.get("carry_on", [])
+    checked  = quote_prices.get("checked", [])
+    seats    = quote_prices.get("seats", [])
+    cur      = quote_prices.get("currency", "MXN")
+
+    if not carry_on and not checked:
+        return None
+
+    min_carry   = min(carry_on) if carry_on else None
+    min_checked = min(checked) if checked else None
+    min_seat    = min(seats) if seats else None
+
+    result: dict = {
+        "currency": cur,
+    }
+    if min_checked:
+        result["checked_bag_note"] = (
+            f"checked bag not included (Zero fare) "
+            f"– add-on from {cur} {min_checked:.0f}"
+        )
+        result["checked_bag_from"] = min_checked
+    else:
+        result["checked_bag_note"] = "checked bag not included (Zero fare)"
+
+    if min_carry:
+        result["bags_note"] = (
+            f"carry-on not included (Zero fare) "
+            f"– add-on from {cur} {min_carry:.0f}"
+        )
+        result["carry_on_from"] = min_carry
+    else:
+        result["bags_note"] = "personal item only included in Zero fare"
+
+    result["seat_note"] = (
+        f"seat selection add-on from {cur} {min_seat:.0f}"
+        if min_seat
+        else "seat selection available"
+    )
+    if min_seat:
+        result["seat_from"] = min_seat
+
+    return result
+
+
+# ── CM — Copa Airlines ────────────────────────────────────────────────────────
+
+async def _probe_cm(
+    origin: str,
+    dest: str,
+    date_str: Optional[str] = None,
+    flight_no: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Copa Airlines (CM) — direct HTTP probe via api.copaair.com/ibe/booking/plan.
+
+    Copa's IBE pre-fetches the plan API on page load (no CAPTCHA challenge).
+    Response includes:
+      - solutions[].economyBasicPriceDiff — USD diff from Basic (no bag) to
+        Economy Classic (1 × 23 kg bag included)
+      - solutions[].offers[].fareFamily.isEconomyBasic — identifies Basic tier
+      - solutions[].offers[].totalPrice — per tier pricing
+
+    We take the cheapest Basic fare and the cheapest Classic fare from the first
+    direct (non-stop / 1-stop) solution to compute the bag add-on.
+
+    Fallback: if no multiple fare families are present, use economyBasicPriceDiff
+    directly as the checked bag add-on cost.
+
+    PTY is used as a fallback origin because Copa is Panama-centric.
+    """
+    probe_origin = origin if (origin and len(origin) == 3) else "PTY"
+    probe_dest = dest if (dest and len(dest) == 3 and dest != probe_origin) else "BOG"
+    if probe_dest == probe_origin:
+        probe_dest = "BOG"
+
+    dep = _probe_date(date_str, weeks_ahead=6)
+
+    plan_url = (
+        f"https://api.copaair.com/ibe/booking/plan"
+        f"?departureAirport1={probe_origin}"
+        f"&arrivalAirport1={probe_dest}"
+        f"&departureDate1={dep}"
+        f"&adults=1&children=0&infants=0&isRoundTrip=false"
+        f"&departureAirport2={probe_dest}&arrivalAirport2={probe_origin}"
+        f"&departureDate2=undefined"
+    )
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/135.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://shopping.copaair.com/",
+        "Origin": "https://shopping.copaair.com",
+    }
+
+    try:
+        from curl_cffi import requests as _curl_requests
+        from .browser import get_curl_cffi_proxies as _get_proxies_cm
+        _proxies_cm = _get_proxies_cm()
+        resp = await asyncio.to_thread(
+            lambda: _curl_requests.get(
+                plan_url,
+                headers=headers,
+                impersonate="chrome131",
+                timeout=30,
+                proxies=_proxies_cm,
+            )
+        )
+        if resp.status_code != 200:
+            logger.debug("CM probe: plan HTTP %d for %s→%s", resp.status_code, probe_origin, probe_dest)
+            return None
+        data = resp.json()
+    except Exception as exc:
+        logger.debug("CM probe: HTTP error: %s", exc)
+        return None
+
+    # data is list[originDestination]; take first
+    if not isinstance(data, list) or not data:
+        logger.debug("CM probe: unexpected plan response shape")
+        return None
+
+    od = data[0]
+    currency = (od.get("currency") or {}).get("code", "USD")
+    solutions = od.get("solutions") or []
+    if not solutions:
+        logger.debug("CM probe: no solutions for %s→%s", probe_origin, probe_dest)
+        return None
+
+    # Find cheapest Basic and cheapest Classic fares across all solutions
+    basic_prices: List[float] = []
+    classic_prices: List[float] = []
+    basic_diffs: List[float] = []
+
+    for sol in solutions:
+        diff = sol.get("economyBasicPriceDiff")
+        if diff is not None:
+            try:
+                basic_diffs.append(float(diff))
+            except (TypeError, ValueError):
+                pass
+        for offer in sol.get("offers") or []:
+            ff = offer.get("fareFamily") or {}
+            price = offer.get("totalPrice")
+            if price is None:
+                continue
+            try:
+                price = float(price)
+            except (TypeError, ValueError):
+                continue
+            if ff.get("isEconomyBasic"):
+                basic_prices.append(price)
+            elif ff.get("code") in ("CLS", "CLF"):  # Economy Classic / Full
+                classic_prices.append(price)
+
+    if not basic_prices:
+        logger.debug("CM probe: no Basic fares found for %s→%s", probe_origin, probe_dest)
+        return None
+
+    min_basic = min(basic_prices)
+    bag_add_on: float
+
+    if basic_diffs:
+        bag_add_on = min(basic_diffs)
+    elif classic_prices:
+        bag_add_on = min(classic_prices) - min_basic
+    else:
+        logger.debug("CM probe: cannot determine bag cost for %s→%s", probe_origin, probe_dest)
+        return None
+
+    if bag_add_on <= 0:
+        logger.debug("CM probe: non-positive bag diff %.2f for %s→%s", bag_add_on, probe_origin, probe_dest)
+        return None
+
+    return {
+        "checked_bag_note": (
+            f"checked bag not included in Economy Basic fare "
+            f"– add-on from {currency} {bag_add_on:.2f} "
+            f"(or upgrade to Economy Classic which includes 1×23 kg)"
+        ),
+        "bags_note": "carry-on included in all fares",
+        "checked_bag_from": bag_add_on,
+        "currency": currency,
+        "seat_from": 15.0,
+        "seat_note": "seat selection from ~USD 15 — add-on (Economy Basic); included in higher fares",
+    }
+
+
+# ── G3 — GOL Linhas Aéreas ────────────────────────────────────────────────────
+
+async def _probe_g3(
+    origin: str,
+    dest: str,
+    date_str: Optional[str] = None,
+    flight_no: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    GOL (G3) — live bag-price probe via GOL BFF (bff-flight.voegol.com.br).
+
+    Reuses the production GOL connector's persistent Chrome context, which
+    maintains valid Akamai session cookies across searches.
+
+    Flow:
+      1. Get (or create) the GOL persistent Chrome context.
+      2. Navigate to /compra and wait for the Angular auth token to appear in
+         sessionStorage.
+      3. Inject search params (origin, dest, date) into sessionStorage.
+      4. Navigate to /compra/selecao-de-voo2/ida — Angular resolver fires POST
+         to bff-flight.voegol.com.br/flights/search.
+      5. Capture the BFF response via page.on("response") and parse offers.
+      6. Navigate back to /compra (keeps the SPA alive for the next search).
+
+    BFF response structure (confirmed from production gol.py):
+      offers[].fareFamily[].name                       → "LI"/"LIGHT" (no bag), "SMART" (1×23 kg), "MAX" (2×23 kg)
+      offers[].fareFamily[].baggageAllowance.quantity  → 0 = no free checked bag
+      offers[].fareFamily[].additionalBaggage.totalAmount → add-on cost (BRL)
+      offers[].fareFamily[].price.total                → fare price (BRL)
+      offers[].fareFamily[].price.currency             → "BRL"
+    """
+    from .gol import _get_context as _gol_get_context
+    from .gol import _GOL_BASE as _GOL_BASE_URL
+
+    probe_origin = origin if (origin and len(origin) == 3) else "GRU"
+    probe_dest = dest if (dest and len(dest) == 3 and dest != probe_origin) else "CGH"
+    if probe_dest == probe_origin:
+        probe_dest = "CGH"
+
+    dep = _probe_date(date_str, weeks_ahead=4)
+    dep_dt_str = f"{dep}T00:00:00"
+
+    captured_offers: List[dict] = []
+    api_event = asyncio.Event()
+
+    try:
+        ctx = await _gol_get_context()
+
+        # Reuse existing GOL page if available, else open a new one
+        page = None
+        for p in list(ctx.pages):
+            try:
+                if "voegol.com.br" in p.url and not p.is_closed():
+                    page = p
+                    break
+            except Exception:
+                pass
+        if page is None:
+            page = await ctx.new_page()
+            await page.goto(f"{_GOL_BASE_URL}/compra",
+                            wait_until="domcontentloaded", timeout=30_000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+
+        # Ensure we're on a GOL page with a live Angular session
+        try:
+            current_url = page.url
+        except Exception:
+            current_url = ""
+        if "voegol.com.br" not in current_url:
+            await page.goto(f"{_GOL_BASE_URL}/compra",
+                            wait_until="domcontentloaded", timeout=30_000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+
+        # Wait for Angular auth token in sessionStorage
+        uuid: Optional[str] = None
+        for _ in range(20):
+            await asyncio.sleep(1)
+            try:
+                result = await page.evaluate("""() => {
+                    for (let i = 0; i < sessionStorage.length; i++) {
+                        const k = sessionStorage.key(i);
+                        const m = k.match(/^([0-9a-f-]{36})_@SiteGolB2C:token$/);
+                        if (m) return {uuid: m[1]};
+                    }
+                    return {uuid: null};
+                }""")
+                uuid = result.get("uuid")
+                if uuid:
+                    break
+            except Exception:
+                pass
+
+        if not uuid:
+            logger.debug("G3 probe: no auth token for %s→%s", probe_origin, probe_dest)
+            return None
+
+        # Build search payload (mirrors production gol.py _build_search_payload)
+        search_payload = {
+            "promocodebanner": False,
+            "destinationCountryToUSA": False,
+            "lastSearchCourtesyTicket": False,
+            "passengerCourtesyType": None,
+            "airSearch": {
+                "cabinClass": "ECONOMY",
+                "currency": None,
+                "pointOfSale": "BR",
+                "awardBooking": False,
+                "searchType": "BRANDED",
+                "promoCodes": [""],
+                "originalItineraryParts": [{
+                    "from": {"code": probe_origin, "useNearbyLocations": False},
+                    "to": {"code": probe_dest, "useNearbyLocations": False},
+                    "when": {"date": dep_dt_str},
+                }],
+                "itineraryParts": [{
+                    "from": {"code": probe_origin, "useNearbyLocations": False},
+                    "to": {"code": probe_dest, "useNearbyLocations": False},
+                    "when": {"date": dep_dt_str},
+                }],
+                "passengers": {"ADT": 1, "TEEN": 0, "CHD": 0, "INF": 0, "UNN": 0},
+            },
+        }
+        passengers = {"ADT": 1, "TEEN": 0, "CHD": 0, "INF": 0, "UNN": 0}
+
+        await page.evaluate("""({uuid, search, passengers}) => {
+            sessionStorage.setItem(uuid + '_@SiteGolB2C:search', JSON.stringify(search));
+            sessionStorage.setItem(uuid + '_@SiteGolB2C:search-properties',
+                JSON.stringify({journey: 'one-way'}));
+            sessionStorage.setItem(uuid + '_@SiteGolB2C:passengers', JSON.stringify(passengers));
+            sessionStorage.setItem('flightSelectionScreen', JSON.stringify('v2'));
+        }""", {"uuid": uuid, "search": search_payload, "passengers": passengers})
+
+        async def on_response(response):
+            try:
+                if response.status != 200:
+                    return
+                url = response.url
+                if "voegol.com.br" not in url:
+                    return
+                ct = response.headers.get("content-type", "")
+                if "json" not in ct:
+                    return
+                if any(s in url for s in ["/assets/", "/i18n/", "channelcfg-api",
+                                           "cookielaw", "onetrust", "datadoghq",
+                                           "/M45P/", "gol-auth-api"]):
+                    return
+                data = await response.json()
+                if isinstance(data, dict) and "offers" in data:
+                    captured_offers.clear()
+                    captured_offers.extend(data["offers"])
+                    api_event.set()
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+        try:
+            await page.goto(f"{_GOL_BASE_URL}/compra/selecao-de-voo2/ida",
+                            wait_until="domcontentloaded", timeout=30_000)
+            try:
+                await asyncio.wait_for(api_event.wait(), timeout=35.0)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("G3 probe: BFF timeout for %s→%s", probe_origin, probe_dest)
+        finally:
+            page.remove_listener("response", on_response)
+
+        # Navigate back to /compra (keeps context alive for next probe)
+        try:
+            await page.goto(f"{_GOL_BASE_URL}/compra",
+                            wait_until="domcontentloaded", timeout=15_000)
+            await asyncio.sleep(1)
+        except Exception:
+            pass
+
+    except Exception as exc:
+        logger.debug("G3 probe error: %s", exc)
+        return None
+
+    if not captured_offers:
+        logger.debug("G3 probe: no offers captured for %s→%s", probe_origin, probe_dest)
+        return None
+
+    # Parse: find cheapest no-bag fare and extract its additionalBaggage price
+    bag_add_on_prices: List[float] = []
+    currency = "BRL"
+
+    for offer in captured_offers:
+        ff = offer.get("fareFamily") or []
+        for fare in ff:
+            price_info = fare.get("price") or {}
+            currency = price_info.get("currency", "BRL")
+
+            bag_allow = (
+                fare.get("baggageAllowance")
+                or fare.get("baggage")
+                or fare.get("checkedBaggage")
+                or {}
+            )
+            qty = None
+            if isinstance(bag_allow, dict):
+                qty = bag_allow.get("quantity") or bag_allow.get("pieces")
+            try:
+                qty_int = int(qty) if qty is not None else -1
+            except (TypeError, ValueError):
+                qty_int = -1
+
+            # Infer from fare name when quantity field is absent
+            if qty_int < 0:
+                name_up = str(fare.get("name") or fare.get("code") or "").upper()
+                if "LIGHT" in name_up or name_up in ("LI", "LITE", "PROMO"):
+                    qty_int = 0
+                elif any(k in name_up for k in ("SMART", "PLUS", "MAX", "TOP", "PREMIUM")):
+                    qty_int = 1  # has bag — skip
+
+            if qty_int != 0:
+                continue  # only price no-bag fares
+
+            add_bag = (
+                fare.get("additionalBaggage")
+                or fare.get("extraBaggage")
+                or fare.get("upgradeBaggage")
+                or {}
+            )
+            if isinstance(add_bag, dict):
+                add_price = (
+                    add_bag.get("totalAmount")
+                    or add_bag.get("amount")
+                    or (add_bag.get("price") or {}).get("total")
+                )
+                if add_price:
+                    try:
+                        bag_add_on_prices.append(float(add_price))
+                    except (TypeError, ValueError):
+                        pass
+
+    if not bag_add_on_prices:
+        logger.debug("G3 probe: no bag add-on prices for %s→%s", probe_origin, probe_dest)
+        return None
+
+    min_bag = min(bag_add_on_prices)
+
+    return {
+        "checked_bag_note": (
+            f"checked bag not included in Light fare "
+            f"– add-on from {currency} {min_bag:.0f}"
+        ),
+        "bags_note": "carry-on (10 kg) included in all GOL fares",
+        "checked_bag_from": min_bag,
+        "currency": currency,
+        "seat_note": "seat selection add-on available at checkout",
+    }
+
+
+# ── AD — Azul ─────────────────────────────────────────────────────────────────
+
+async def _probe_ad(
+    origin: str,
+    dest: str,
+    date_str: Optional[str] = None,
+    flight_no: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Azul (AD) — Navitaire availability API probe via www.voeazul.com.br.
+
+    Reuses the Azul connector's persistent Chrome context (shared session/cookies)
+    which bypasses Akamai bot protection via persistent headed Chrome.
+
+    Flow:
+      1. Get the Azul persistent Chrome context via azul._get_context().
+      2. Navigate to www.voeazul.com.br/us/en/home/selecao-voo deep-link URL.
+      3. Wait for the Navitaire reservationavailability/v5 (or v6) API response.
+      4. Parse the cheapest AZUL (no bag) and BLUE (1×23 kg) fares from all
+         journeys in the first trip.
+      5. Return price difference as checked bag add-on cost.
+
+    Azul Navitaire bundle codes:
+      AZUL / A / AZ   → no free checked bag (base fare)
+      BLUE / BU / XT  → 1×23 kg bag included
+      BLACK / BL      → 2×23 kg bags included
+    """
+    from datetime import date as _date_cls
+    from .azul import _get_context as _azul_get_context
+
+    probe_origin = origin if (origin and len(origin) == 3) else "GRU"
+    probe_dest   = dest if (dest and len(dest) == 3 and dest != probe_origin) else "CNF"
+    if probe_dest == probe_origin:
+        probe_dest = "CNF"
+
+    dep = _probe_date(date_str, weeks_ahead=6)
+    dep_dt = _date_cls.fromisoformat(dep)
+    dep_str_url = dep_dt.strftime("%m/%d/%Y")
+
+    search_url = (
+        f"https://www.voeazul.com.br/us/en/home/selecao-voo"
+        f"?c[0].ds={probe_origin}&c[0].as={probe_dest}"
+        f"&c[0].std={dep_str_url}"
+        f"&p[0].t=ADT&p[0].c=1&p[0].cp=false&cc=BRL"
+    )
+
+    captured: dict = {}
+    api_event = asyncio.Event()
+
+    async def on_response(response) -> None:
+        try:
+            if response.status != 200:
+                return
+            url = response.url
+            if "reservationavailability" not in url:
+                return
+            if "/availability/v" not in url:
+                return
+            ct = response.headers.get("content-type", "")
+            if "json" not in ct:
+                return
+            body = await response.json()
+            if isinstance(body, dict) and body.get("data") and body["data"] != {}:
+                captured["avail"] = body
+                api_event.set()
+                logger.debug("AD probe: captured availability for %s→%s", probe_origin, probe_dest)
+        except Exception:
+            pass
+
+    page = None
+    try:
+        ctx = await _azul_get_context()
+        page = await ctx.new_page()
+        page.on("response", on_response)
+
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+        except Exception as exc:
+            logger.debug("AD probe: goto error: %s", exc)
+
+        try:
+            await asyncio.wait_for(api_event.wait(), timeout=55.0)
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.debug("AD probe: availability timed out for %s→%s", probe_origin, probe_dest)
+
+    except Exception as exc:
+        logger.debug("AD probe error: %s", exc)
+    finally:
+        if page is not None:
+            try:
+                page.remove_listener("response", on_response)
+            except Exception:
+                pass
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+    data = captured.get("avail")
+    if data is None:
+        return None
+
+    # Parse cheapest AZUL (no bag) and BLUE (1×23 kg) fares from first trip
+    trips = data.get("data", {}).get("trips") or data.get("trips") or []
+    azul_prices: List[float] = []
+    blue_prices: List[float] = []
+    black_prices: List[float] = []
+    currency = "BRL"
+
+    for trip in trips:
+        journeys = trip.get("journeys") or trip.get("journeysAvailable") or []
+        if not isinstance(journeys, list):
+            continue
+        for journey in journeys:
+            cur_raw = (
+                (journey.get("fareInformation") or {}).get("currency")
+                or (journey.get("identifier") or {}).get("currency")
+                or "BRL"
+            )
+            currency = cur_raw
+
+            fares = journey.get("fares") or []
+            for fare in fares:
+                if not isinstance(fare, dict):
+                    continue
+                bc = str(
+                    fare.get("bundleCode") or fare.get("bundleInformation")
+                    or fare.get("fareClass") or fare.get("fareName")
+                    or fare.get("fareCode") or ""
+                ).upper()
+
+                # Extract cheapest per-pax price for this fare
+                pax_fares = fare.get("paxFares") or fare.get("passengerFares") or []
+                fare_price: Optional[float] = None
+                for pf in pax_fares:
+                    for key in ("totalAmount", "originalAmount", "fareAmount"):
+                        val = pf.get(key)
+                        if val is not None:
+                            try:
+                                v = float(val)
+                                if v > 0:
+                                    fare_price = v
+                                    break
+                            except (TypeError, ValueError):
+                                pass
+                    if fare_price is not None:
+                        break
+
+                if fare_price is None:
+                    continue
+
+                if "BLACK" in bc or bc in ("BL", "BLK"):
+                    black_prices.append(fare_price)
+                elif "BLUE" in bc or bc in ("BU", "XTRA", "XT"):
+                    blue_prices.append(fare_price)
+                else:
+                    # AZUL / A / AZ or unknown base fare — treat as no-bag tier
+                    azul_prices.append(fare_price)
+        break  # only first trip needed
+
+    if not azul_prices and not blue_prices and not black_prices:
+        logger.debug("AD probe: no fares parsed for %s→%s", probe_origin, probe_dest)
+        return None
+
+    result: dict = {"currency": currency}
+
+    if azul_prices and blue_prices:
+        min_azul = min(azul_prices)
+        min_blue  = min(blue_prices)
+        bag_diff  = max(0.0, min_blue - min_azul)
+        if bag_diff > 0:
+            result["checked_bag_note"] = (
+                f"checked bag not included in base fare "
+                f"– add-on approx {currency} {bag_diff:.0f}"
+            )
+            result["checked_bag_from"] = bag_diff
+        else:
+            result["checked_bag_note"] = "checked bag not included in base fare (Azul fare)"
+    elif blue_prices or black_prices:
+        result["checked_bag_note"] = "1×23 kg bag included in fare"
+        result["checked_bag_from"] = 0.0
+    else:
+        result["checked_bag_note"] = "checked bag not included in base fare (Azul fare)"
+
+    result["bags_note"] = result.get(
+        "checked_bag_note", "checked bag not included in base fare"
+    )
+    result["seat_note"] = "seat selection available at checkout"
+
+    return result
+
+
+# ── VB — VivaAerobus ─────────────────────────────────────────────────────────
+
+def _vb_parse_search(data: dict) -> Optional[dict]:
+    """Parse VivAerobus /web/v1/availability/search 200 response for bundle pricing.
+
+    Expects a Navitaire-style trips[].journeys[].fares[] structure.
+    Computes carry-on add-on as the cheapest non-VC bundle minus the VC base price.
+    """
+    trips = (
+        data.get("trips")
+        or data.get("data", {}).get("trips")
+        or []
+    )
+    if not trips:
+        return None
+
+    all_fares: List[dict] = []
+    for trip in trips[:1]:
+        for journey in (trip.get("journeys") or [])[:3]:
+            for fare in (journey.get("fares") or []):
+                all_fares.append(fare)
+
+    if not all_fares:
+        return None
+
+    bundle_prices: dict[str, List[float]] = {}
+    for fare in all_fares:
+        code = (
+            fare.get("bundleCode")
+            or fare.get("fareClassOfService")
+            or fare.get("fareCode")
+            or "UNK"
+        )
+        for pf in (fare.get("passengerFares") or []):
+            pf_fare = (
+                pf.get("discountedFare")
+                or pf.get("publishedFare")
+                or {}
+            )
+            total = pf_fare.get("totalFare") or pf_fare.get("total")
+            if total is None:
+                total = pf.get("totalFare") or pf.get("total")
+            if total is not None:
+                try:
+                    bundle_prices.setdefault(code, []).append(float(total))
+                except (TypeError, ValueError):
+                    pass
+
+    if not bundle_prices:
+        return None
+
+    cheapest = {code: min(prices) for code, prices in bundle_prices.items()}
+    base_price = cheapest.get("VC") or min(cheapest.values())
+    non_base = {c: p for c, p in cheapest.items() if c != "VC" and p > base_price}
+
+    if not non_base:
+        return None
+
+    carry_on_add = round(min(non_base.values()) - base_price, 2)
+    if carry_on_add <= 0:
+        return None
+
+    return {
+        "carry_on_from": carry_on_add,
+        "bags_note": (
+            f"personal item (under seat) included in base VC fare; "
+            f"overhead carry-on add-on from MXN {carry_on_add:.0f}"
+        ),
+        "checked_bag_note": "checked bag not included in base VC fare – add at checkout",
+        "currency": "MXN",
+        "seat_note": "seat selection available at checkout",
+    }
+
+
+async def _probe_vb(
+    origin: str,
+    dest: str,
+    date_str: Optional[str] = None,
+    flight_no: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    VivaAerobus (VB) — patchright persistent-context probe.
+
+    VivAerobus is an ultra-LCC: the base "VC" (Viva Clásico) fare includes only
+    a personal item (under seat, 45×35×25 cm).  Overhead carry-on and checked
+    bags are paid add-ons.
+
+    We navigate to the checkout URL using a persistent Chrome profile.  The
+    profile dir is reused across restarts so Akamai cookies warm up over time.
+    On cold sessions the /web/v1/availability/search fires but may return 403;
+    in that case we return a static-but-correct dict so callers still get the
+    right condition strings without a live price.
+
+    Live data: parse fare bundles from search response to compute carry-on add-on.
+    Static fallback: known VivAerobus fare rules with typical pricing notes.
+    """
+    from .vivaaerobus import _get_context as _vb_get_context
+
+    probe_origin = origin if (origin and len(origin) == 3) else "MEX"
+    probe_dest = dest if (dest and len(dest) == 3 and dest != probe_origin) else "MTY"
+    if probe_dest == probe_origin:
+        probe_dest = "MTY"
+
+    dep_date = _probe_date(date_str, weeks_ahead=5)
+    dep_yyyymmdd = dep_date.replace("-", "")
+
+    checkout_url = (
+        f"https://www.vivaaerobus.com/en-us/book/options"
+        f"?itineraryCode={probe_origin}_{probe_dest}_{dep_yyyymmdd}"
+        f"&passengers=A1"
+    )
+
+    _static: dict = {
+        "bags_note": (
+            "personal item (under seat, 45×35×25 cm) included in base VC fare; "
+            "overhead carry-on bag is a paid add-on"
+        ),
+        "checked_bag_note": (
+            "no free checked bag on VC base fare – add at checkout "
+            "(carry-on typically from MXN 249; checked bag from MXN 499)"
+        ),
+        "currency": "MXN",
+        "seat_from": 99.0,
+        "seat_note": "seat selection from ~MXN 99 – add at checkout",
+    }
+
+    search_data: Optional[dict] = None
+    search_event = asyncio.Event()
+
+    try:
+        ctx = await _vb_get_context()
+        page = await ctx.new_page()
+
+        async def _on_resp(resp) -> None:
+            nonlocal search_data
+            if resp.status != 200:
+                return
+            if "/web/v1/availability/search" not in resp.url:
+                return
+            try:
+                ct = resp.headers.get("content-type", "")
+                if "json" not in ct:
+                    return
+                data = await resp.json()
+                if isinstance(data, dict):
+                    search_data = data
+                    search_event.set()
+            except Exception:
+                pass
+
+        page.on("response", _on_resp)
+
+        try:
+            await page.goto(checkout_url, wait_until="domcontentloaded", timeout=25_000)
+        except Exception as exc:
+            logger.debug("VB probe: goto error: %s", exc)
+
+        try:
+            await asyncio.wait_for(search_event.wait(), timeout=20.0)
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.debug(
+                "VB probe: availability search timed out for %s→%s (cold session or Akamai block)",
+                probe_origin, probe_dest,
+            )
+
+        await page.close()
+
+    except Exception as exc:
+        logger.debug("VB probe: context/page error: %s", exc)
+
+    if search_data:
+        try:
+            parsed = _vb_parse_search(search_data)
+            if parsed:
+                result = dict(_static)
+                result.update(parsed)
+                return result
+        except Exception as exc:
+            logger.debug("VB probe: parse error: %s", exc)
+
+    return _static
+
+
+# ── FO — Flybondi ─────────────────────────────────────────────────────────────
+
+async def _probe_fo(
+    origin: str,
+    dest: str,
+    date_str: Optional[str] = None,
+    flight_no: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Flybondi (FO) — SSR HTML probe for carry-on and checked-bag add-on prices.
+
+    Flybondi embeds full flight+fare data as JSON in <script> tags on the
+    /ar/search/results page.  This probe fetches that page via curl_cffi (same
+    technique as FlybondiConnectorClient._fetch_all_edges) and computes:
+
+      carry-on add-on  = PLUS fare price  − STANDARD fare price
+      checked-bag diff = FLEX fare price  − STANDARD fare price (if FLEX present)
+
+    Falls back to static known Flybondi pricing if curl_cffi is unavailable or
+    the embedded JSON doesn't contain multiple fare types.
+
+    Currency is ARS (Argentina).
+    """
+    import re as _re
+
+    try:
+        from curl_cffi import requests as _curl_requests
+        from .browser import get_curl_cffi_proxies as _get_proxies
+    except ImportError:
+        _curl_requests = None
+        _get_proxies = lambda: {}  # noqa: E731
+
+    probe_origin = origin if (origin and len(origin) == 3) else "EZE"
+    probe_dest = dest if (dest and len(dest) == 3 and dest != probe_origin) else "COR"
+    if probe_dest == probe_origin:
+        probe_dest = "COR"
+
+    dep = _probe_date(date_str, weeks_ahead=6)
+
+    _static: dict = {
+        "bags_note": (
+            "personal item (under seat) included in STANDARD fare; "
+            "overhead carry-on (10 kg) is a paid add-on"
+        ),
+        "checked_bag_note": (
+            "no free checked bag in STANDARD fare – add at checkout"
+        ),
+        "currency": "ARS",
+        "seat_from": 2000.0,
+        "seat_note": "seat selection from ~ARS 2,000 – add at checkout",
+    }
+
+    if _curl_requests is None:
+        logger.debug("FO probe: curl_cffi not available, returning static fallback")
+        return _static
+
+    search_url = (
+        f"https://flybondi.com/ar/search/results"
+        f"?departureDate={dep}&adults=1&children=0&infants=0"
+        f"&currency=ARS&fromCityCode={probe_origin}&toCityCode={probe_dest}"
+    )
+
+    try:
+        proxies = _get_proxies()
+        resp = await asyncio.to_thread(
+            lambda: _curl_requests.get(
+                search_url,
+                impersonate="chrome131",
+                timeout=25,
+                proxies=proxies,
+            )
+        )
+    except Exception as exc:
+        logger.debug("FO probe: HTTP error: %s", exc)
+        return _static
+
+    if resp.status_code != 200:
+        logger.debug("FO probe: HTTP %d for %s→%s", resp.status_code, probe_origin, probe_dest)
+        return _static
+
+    scripts = _re.findall(r"<script[^>]*>(.*?)</script>", resp.text, _re.DOTALL)
+    edges: Optional[list] = None
+    for s in scripts:
+        s = s.strip()
+        if len(s) < 50000 or "viewer" not in s:
+            continue
+        try:
+            data = json.loads(s)
+            edges = (
+                data.get("viewer", {}).get("flights", {}).get("edges")
+                or data.get("props", {}).get("pageProps", {})
+                    .get("viewer", {}).get("flights", {}).get("edges")
+            )
+            if edges:
+                break
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    if not edges:
+        logger.debug("FO probe: no flight edges in SSR for %s→%s", probe_origin, probe_dest)
+        return _static
+
+    fare_type_prices: dict[str, List[float]] = {}
+    for edge in edges[:5]:
+        node = edge.get("node", {})
+        for fare in (node.get("fares") or []):
+            if not isinstance(fare, dict):
+                continue
+            fare_type = (fare.get("type") or "").upper()
+            if not fare_type:
+                continue
+            prices = fare.get("prices", {})
+            after_tax = prices.get("afterTax") or prices.get("total") or fare.get("price")
+            if after_tax is None:
+                continue
+            try:
+                v = float(after_tax)
+                if v > 0:
+                    fare_type_prices.setdefault(fare_type, []).append(v)
+            except (TypeError, ValueError):
+                pass
+
+    if not fare_type_prices:
+        logger.debug("FO probe: no fare type prices in SSR for %s→%s", probe_origin, probe_dest)
+        return _static
+
+    # Median price per fare type
+    type_median: dict[str, float] = {}
+    for ft, prices in fare_type_prices.items():
+        prices.sort()
+        type_median[ft] = prices[len(prices) // 2]
+
+    std_price = type_median.get("STANDARD") or min(type_median.values())
+    result = dict(_static)
+
+    if "PLUS" in type_median and type_median["PLUS"] > std_price:
+        carry_add = round(type_median["PLUS"] - std_price, 2)
+        result["carry_on_from"] = carry_add
+        result["bags_note"] = (
+            f"personal item (under seat) in STANDARD fare; "
+            f"carry-on overhead add-on from ARS {carry_add:.0f} (PLUS bundle)"
+        )
+
+    if "FLEX" in type_median and type_median["FLEX"] > std_price:
+        flex_add = round(type_median["FLEX"] - std_price, 2)
+        result["checked_bag_from"] = flex_add
+        result["checked_bag_note"] = (
+            f"no free checked bag in STANDARD fare; "
+            f"FLEX bundle (carry-on + checked bag) from ARS {flex_add:.0f} more"
+        )
+
+    logger.debug("FO probe: %s→%s fare types=%s", probe_origin, probe_dest, list(type_median.keys()))
     return result
 
 
@@ -1812,6 +3229,8 @@ async def _probe_af(
             if seat_prices
             else "seat selection add-on available"
         )
+        if seat_prices:
+            result["seat_from"] = min(seat_prices)
         return result
 
     logger.debug("AF probe: no bag prices captured for %s→%s", probe_origin, probe_dest)
@@ -2266,6 +3685,8 @@ async def _probe_kl(
             if seat_prices
             else "seat selection add-on available"
         )
+        if seat_prices:
+            result["seat_from"] = min(seat_prices)
         return result
 
     logger.debug("KL probe: no bag prices captured for %s→%s", probe_origin, probe_dest)
@@ -2450,6 +3871,8 @@ async def _probe_ba(
             if seat_prices
             else "seat selection add-on available"
         )
+        if seat_prices:
+            result["seat_from"] = min(seat_prices)
         return result
 
     logger.debug("BA probe: no bag prices captured for %s→%s", probe_origin, probe_dest)
@@ -2659,6 +4082,8 @@ async def _probe_lh(
             if seat_prices
             else "seat selection add-on available"
         )
+        if seat_prices:
+            result["seat_from"] = min(seat_prices)
         return result
 
     logger.debug("LH probe: no bag prices captured for %s→%s", probe_origin, probe_dest)
@@ -2810,6 +4235,8 @@ async def _probe_ib(
             if seat_prices
             else "seat selection add-on available"
         )
+        if seat_prices:
+            result["seat_from"] = min(seat_prices)
         return result
 
     logger.debug("IB probe: no bag prices captured for %s→%s", probe_origin, probe_dest)
@@ -2962,6 +4389,8 @@ async def _probe_ac(
             if seat_prices
             else "seat selection add-on available"
         )
+        if seat_prices:
+            result["seat_from"] = min(seat_prices)
         return result
 
     logger.debug("AC probe: no bag prices captured for %s→%s", probe_origin, probe_dest)
@@ -3113,6 +4542,8 @@ async def _probe_ay(
             if seat_prices
             else "seat selection add-on available"
         )
+        if seat_prices:
+            result["seat_from"] = min(seat_prices)
         return result
 
     logger.debug("AY probe: no bag prices captured for %s→%s", probe_origin, probe_dest)
@@ -3262,6 +4693,8 @@ async def _probe_a3(
             if seat_prices
             else "seat selection add-on available"
         )
+        if seat_prices:
+            result["seat_from"] = min(seat_prices)
         return result
 
     logger.debug("A3 probe: no bag prices captured for %s→%s", probe_origin, probe_dest)
@@ -3413,6 +4846,8 @@ async def _probe_nz(
             if seat_prices
             else "seat selection add-on available"
         )
+        if seat_prices:
+            result["seat_from"] = min(seat_prices)
         return result
 
     logger.debug("NZ probe: no bag prices captured for %s→%s", probe_origin, probe_dest)
@@ -3564,6 +4999,8 @@ async def _probe_qf(
             if seat_prices
             else "seat selection add-on available"
         )
+        if seat_prices:
+            result["seat_from"] = min(seat_prices)
         return result
 
     logger.debug("QF probe: no bag prices captured for %s→%s", probe_origin, probe_dest)
@@ -3579,6 +5016,12 @@ _PROBERS = {
     "SZ": _probe_sz,
     "LA": _probe_la,
     "JJ": _probe_la,  # LATAM Brazil (same booking engine)
+    "Y4": _probe_y4,  # Volaris (Navitaire)
+    "CM": _probe_cm,  # Copa Airlines
+    "G3": _probe_g3,  # GOL Linhas Aéreas
+    "AD": _probe_ad,  # Azul Brazilian Airlines (Navitaire)
+    "VB": _probe_vb,  # VivaAerobus (persistent-context, Akamai-warm fallback)
+    "FO": _probe_fo,  # Flybondi (SSR HTML fare-bundle diff)
     # Group 6 — full-service carriers
     "AF": _probe_af,
     "KL": _probe_kl,

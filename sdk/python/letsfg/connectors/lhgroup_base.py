@@ -567,11 +567,14 @@ class LHGroupBaseConnector:
         seat_note = ancillary.get("seat_note", "")
         # Support both static fallback key ("bags_from") and live probe key ("checked_bag_from"/"checked_bag_price")
         bags_from = ancillary.get("checked_bag_from") or ancillary.get("checked_bag_price") or ancillary.get("bags_from")
+        seat_from = ancillary.get("seat_from")
         for offer in offers:
             # carry-on always free on LH Group fares; checked bag is a paid add-on
             offer.bags_price.setdefault("carry_on", 0.0)
             if bags_from is not None:
                 offer.bags_price.setdefault("checked_bag", float(bags_from))
+            if seat_from is not None:
+                offer.bags_price.setdefault("seat", float(seat_from))
             if bags_note:
                 offer.conditions.setdefault("carry_on", bags_note)
             if checked_note:

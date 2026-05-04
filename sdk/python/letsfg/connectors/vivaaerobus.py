@@ -18,10 +18,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
 from curl_cffi.requests import AsyncSession
 
@@ -50,6 +52,40 @@ _HEADERS = {
 
 _http_client: AsyncSession | None = None
 
+# ── Persistent Chrome context for Akamai-protected ancillary probe ─────────────
+_VB_USER_DATA_DIR = str(Path(tempfile.gettempdir()).parent / ".vb_chrome_data")
+_vb_pw: Optional[Any] = None
+_vb_context: Optional[Any] = None
+
+
+async def _get_context() -> Any:
+    """Return (creating if needed) a persistent patchright Chrome context for
+    VivAerobus.  The profile dir is reused across restarts so Akamai cookies
+    accumulate over time."""
+    global _vb_pw, _vb_context
+    if _vb_context is not None:
+        return _vb_context
+    from patchright.async_api import async_playwright as _patchright_playwright
+    _vb_pw = await _patchright_playwright().start()
+    _vb_context = await _vb_pw.chromium.launch_persistent_context(
+        _VB_USER_DATA_DIR,
+        headless=False,
+        args=[
+            "--window-position=-2400,-2400",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--no-first-run",
+        ],
+        locale="en-US",
+        timezone_id="America/Mexico_City",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/135.0.0.0 Safari/537.36"
+        ),
+    )
+    return _vb_context
+
 
 def _get_client() -> AsyncSession:
     global _http_client
@@ -67,7 +103,7 @@ class VivaAerobusConnectorClient:
     async def close(self):
         global _http_client
         if _http_client:
-            _http_client.close()
+            await _http_client.close()
             _http_client = None
 
     async def search_flights(self, req: FlightSearchRequest) -> FlightSearchResponse:
@@ -101,17 +137,26 @@ class VivaAerobusConnectorClient:
     async def _fetch_ancillaries(
         self, origin: str, dest: str, date_str: str, adults: int, currency: str
     ) -> dict | None:
-        """Fetch bag/seat pricing for VivaAerobus. Returns None — the lowfares
-        calendar API exposes base fare only; full availability is Akamai-protected."""
-        return None
+        """Fetch bag/seat pricing via ancillary_live_probe._probe_vb.
+
+        Uses a persistent patchright Chrome context that warms up over time,
+        eventually bypassing Akamai on the /web/v1/availability/search endpoint.
+        Always returns a dict (may be static fallback on first-run cold session).
+        """
+        try:
+            from .ancillary_live_probe import _probe_vb
+            return await _probe_vb(origin, dest, date_str)
+        except Exception as _exc:
+            logger.debug("VivAerobus ancillary probe failed: %s", _exc)
+            return None
 
     def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
         bags_note = ancillary.get("bags_note")
-        checked_note = ancillary.get("checked_bag") or bags_note
+        checked_note = ancillary.get("checked_bag_note") or ancillary.get("checked_bag") or bags_note
         seat_note = ancillary.get("seat_note")
-        bags_from = ancillary.get("bags_from")
-        checked_from = ancillary.get("checked_bag_price")
-        anc_currency = ancillary.get("currency", "MXN")
+        carry_on_from = ancillary.get("carry_on_from")
+        checked_from = ancillary.get("checked_bag_from") or ancillary.get("checked_bag_price")
+        seat_from = ancillary.get("seat_from")
         for offer in offers:
             if bags_note:
                 offer.conditions["carry_on"] = bags_note
@@ -119,10 +164,12 @@ class VivaAerobusConnectorClient:
                 offer.conditions.setdefault("checked_bag", checked_note)
             if seat_note:
                 offer.conditions["seat"] = seat_note
-            if bags_from == 0.0:
-                offer.bags_price["carry_on"] = 0.0
-            if checked_from == 0.0:
-                offer.bags_price["checked_bag"] = 0.0
+            if carry_on_from is not None and carry_on_from > 0:
+                offer.bags_price["carry_on"] = float(carry_on_from)
+            if checked_from is not None and checked_from > 0:
+                offer.bags_price["checked_bag"] = float(checked_from)
+            if seat_from is not None and seat_from > 0:
+                offer.bags_price.setdefault("seat", float(seat_from))
 
 
     async def _search_ow(self, req: FlightSearchRequest) -> FlightSearchResponse:

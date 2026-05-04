@@ -135,10 +135,13 @@ class BritishAirwaysConnectorClient:
         checked_note = ancillary.get("checked_bag") or bags_note
         seat_note = ancillary.get("seat_note")
         checked_from = ancillary.get("checked_bag_price")
+        seat_from = ancillary.get("seat_from")
         for offer in offers:
             offer.bags_price.setdefault("carry_on", 0.0)
             if checked_from is not None:
                 offer.bags_price.setdefault("checked_bag", float(checked_from))
+            if seat_from is not None:
+                offer.bags_price.setdefault("seat", float(seat_from))
             if bags_note:
                 offer.conditions.setdefault("carry_on", bags_note)
             if checked_note:

@@ -949,6 +949,7 @@ class FlydubaiConnectorClient:
         checked_note = ancillary.get("checked_bag_note")
         seat_note = ancillary.get("seat_note")
         checked_from = ancillary.get("checked_bag_from")
+        seat_from = ancillary.get("seat_from")
         for offer in offers:
             if bags_note:
                 offer.conditions["carry_on"] = bags_note
@@ -958,6 +959,8 @@ class FlydubaiConnectorClient:
                 offer.conditions["seat"] = seat_note
             if checked_from is not None:
                 offer.bags_price["checked_bag"] = checked_from
+            if seat_from is not None:
+                offer.bags_price["seat"] = seat_from
 
     def _empty(self, req: FlightSearchRequest) -> FlightSearchResponse:
         h = hashlib.md5(f"flydubai{req.origin}{req.destination}{req.date_from}{req.return_from or ''}".encode()).hexdigest()[:12]

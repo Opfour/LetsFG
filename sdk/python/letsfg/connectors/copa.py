@@ -251,28 +251,38 @@ class CopaConnectorClient:
     async def _fetch_ancillaries(
         self, origin: str, dest: str, date_str: str, adults: int, currency: str
     ) -> dict | None:
-        """Fetch bag/seat pricing for Copa. Returns None — Copa DOM scraping
-        does not expose fare-family bag pricing; ancillary_ref.py handles fallback."""
-        return None
+        """Fetch bag/seat pricing via ancillary_live_probe._probe_cm (direct HTTP)."""
+        try:
+            from .ancillary_live_probe import _probe_cm
+            return await _probe_cm(origin, dest, date_str)
+        except Exception as _exc:
+            logger.debug("Copa ancillary probe failed: %s", _exc)
+            return None
 
     def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
         bags_note = ancillary.get("bags_note")
-        checked_note = ancillary.get("checked_bag") or bags_note
+        checked_note = ancillary.get("checked_bag_note") or ancillary.get("checked_bag") or bags_note
         seat_note = ancillary.get("seat_note")
-        bags_from = ancillary.get("bags_from")
-        checked_from = ancillary.get("checked_bag_price")
-        anc_currency = ancillary.get("currency", "USD")
+        checked_from = ancillary.get("checked_bag_from") or ancillary.get("checked_bag_price")
+        carry_from = ancillary.get("carry_on_from")
+        seat_from = ancillary.get("seat_from")
         for offer in offers:
+            # carry-on is always included on Copa
+            offer.bags_price.setdefault("carry_on", 0.0)
             if bags_note:
-                offer.conditions["carry_on"] = bags_note
+                offer.conditions.setdefault("carry_on", bags_note)
             if checked_note:
                 offer.conditions.setdefault("checked_bag", checked_note)
             if seat_note:
-                offer.conditions["seat"] = seat_note
-            if bags_from == 0.0:
-                offer.bags_price["carry_on"] = 0.0
-            if checked_from == 0.0:
+                offer.conditions.setdefault("seat", seat_note)
+            if carry_from is not None:
+                offer.bags_price.setdefault("carry_on", float(carry_from))
+            if checked_from is not None and checked_from > 0:
+                offer.bags_price["checked_bag"] = float(checked_from)
+            elif checked_from == 0.0:
                 offer.bags_price["checked_bag"] = 0.0
+            if seat_from is not None:
+                offer.bags_price.setdefault("seat", float(seat_from))
 
 
     async def _search_ow(self, req: FlightSearchRequest) -> FlightSearchResponse:

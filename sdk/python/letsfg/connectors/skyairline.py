@@ -347,6 +347,7 @@ class SkyAirlineConnectorClient:
                 airlines=["Sky Airline"],
                 owner_airline="H2",
                 conditions=conditions,
+                bags_price={"seat": 5.0},  # seat selection from ~USD 5
                 booking_url=(
                     f"https://booking.skyairline.com/search/"
                     f"?origin={req.origin}&destination={req.destination}"
@@ -384,7 +385,7 @@ class SkyAirlineConnectorClient:
             conditions["fare_upgrade_note"] = "Sputnik fare calendar — base price only; ancillary prices not available"
             conditions["carry_on"] = "carry-on not included on base fare — add at checkout"
             conditions["checked_bag"] = "checked bag not included on base fare — add at checkout"
-        conditions.setdefault("seat", "seat selection available at checkout")
+        conditions.setdefault("seat", "seat selection from ~USD 5 — add at checkout")
         return conditions
 
     def _empty(self, req: FlightSearchRequest) -> FlightSearchResponse:

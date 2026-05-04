@@ -212,7 +212,7 @@ class WingoConnectorClient:
             conditions["fare_upgrade_note"] = "Route page exposes base fare only; ancillary prices not available"
             conditions["carry_on"] = "carry-on not included on base fare — add at checkout"
             conditions["checked_bag"] = "checked bag not included on base fare — add at checkout"
-        conditions.setdefault("seat", "seat selection available at checkout")
+        conditions.setdefault("seat", "seat selection from ~USD 5 — add at checkout")
         return conditions
 
     def _build_offers(self, fares: list[dict], req: FlightSearchRequest,
@@ -357,6 +357,7 @@ class WingoConnectorClient:
                 airlines=["Wingo"],
                 owner_airline="P5",
                 conditions=conditions,
+                bags_price={"seat": 5.0},  # seat selection from ~USD 5
                 booking_url=(
                     f"https://booking.wingo.com/search/"
                     f"?origin={req.origin}&destination={req.destination}"

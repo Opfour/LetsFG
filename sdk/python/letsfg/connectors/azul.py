@@ -481,6 +481,7 @@ class AzulConnectorClient:
         # Seat selection
         if "seat" not in conditions:
             conditions["seat"] = "seat selection from ~BRL 30 — add at checkout"
+            bags_price.setdefault("seat", 30.0)  # ~BRL 30 seat selection add-on
 
         return conditions, bags_price
 

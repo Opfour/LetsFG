@@ -584,6 +584,7 @@ class AviancaConnectorClient:
 
         conditions.setdefault("carry_on", "1 cabin bag (10 kg, 55\u00d740\u00d725 cm) + 1 personal item included")
         conditions.setdefault("seat", "seat selection from ~USD 10; included on Classic/Flex fares")
+        bags_price.setdefault("seat", 10.0)  # seat selection from ~USD 10 on Basic fare
         return conditions, bags_price
 
     def _extract_segments(self, flight: dict, req: FlightSearchRequest) -> list[FlightSegment]:

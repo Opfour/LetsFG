@@ -325,11 +325,13 @@ class LatamConnectorClient:
                         probe_ancillaries("LA", req.origin, req.destination, date_str),
                         timeout=95.0,
                     )
-                    if live and live.get("checked_bag_from"):
+                    if live:
                         for o in offers:
-                            if "checked_bag" not in o.bags_price:
+                            if live.get("checked_bag_from") and "checked_bag" not in o.bags_price:
                                 o.bags_price["checked_bag"] = live["checked_bag_from"]
                                 o.bags_price["_currency"] = live.get("currency", "CLP")
+                            if live.get("seat_from") and "seat" not in o.bags_price:
+                                o.bags_price["seat"] = live["seat_from"]
                 except Exception as _probe_exc:
                     logger.debug("LA ancillary probe skipped: %s", _probe_exc)
 

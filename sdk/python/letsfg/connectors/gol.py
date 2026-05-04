@@ -708,7 +708,8 @@ class GolConnectorClient:
 
         # Seat selection
         if "seat" not in conditions:
-            conditions["seat"] = "seat selection available at checkout"
+            conditions["seat"] = "seat selection from ~BRL 25 — add at checkout"
+            bags_price.setdefault("seat", 25.0)  # ~BRL 25 seat selection add-on
 
         return conditions, bags_price
 
