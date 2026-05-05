@@ -138,10 +138,15 @@ def _make_google_datetime(date_parts, time_parts, fallback: datetime) -> datetim
     year, month, day = fallback.year, fallback.month, fallback.day
     if _is_google_date_parts(date_parts):
         year, month, day = int(date_parts[0]), int(date_parts[1]), int(date_parts[2])
-    hour = minute = 0
+    # Use fallback time so segment-level parsing inherits the outer offer's time
+    # when segment[8]/segment[10] are absent or in an unexpected format.
+    hour, minute = fallback.hour, fallback.minute
     if _is_google_time_parts(time_parts):
         hour = int(time_parts[0])
         minute = int(time_parts[1]) if len(time_parts) > 1 else 0
+    elif isinstance(time_parts, int) and 0 <= time_parts < 1440:
+        # minutes-since-midnight integer form (seen in some API variants)
+        hour, minute = divmod(time_parts, 60)
     try:
         return datetime(year, month, day, hour, minute)
     except Exception:
