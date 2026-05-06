@@ -18,7 +18,7 @@ import hashlib
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from ..models.flights import (
@@ -30,6 +30,7 @@ from ..models.flights import (
 )
 from .airline_routes import get_city_airports
 from .browser import auto_block_if_proxied
+from .seat_prices import _route_distance_km
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,17 @@ def _api_headers() -> dict[str, str]:
 _CABIN_BAG_BUNDLES = {"smart", "middletwo", "middle", "go", "wizzgo"}
 # Bundle names that include a checked bag (in addition to cabin bag).
 _CHECKED_BAG_BUNDLES = {"plus", "plusflex", "flex", "wizzplus"}
+
+
+def _estimate_duration_s(origin: str, dest: str) -> int:
+    """Estimate one-way block time in seconds from great-circle distance."""
+    km = _route_distance_km(origin, dest)
+    if km < 1000:
+        return int(km / 750 * 3600) + 1800
+    elif km < 4000:
+        return int(km / 800 * 3600) + 2700
+    else:
+        return int(km / 850 * 3600) + 3600
 
 
 def _parse_wizzair_bundle_prices(search_result: dict) -> dict:
@@ -614,33 +626,29 @@ class WizzairConnectorClient:
                     continue
 
                 dep_dt = self._parse_dt(slot_dt_str)
-                key = f"W6_{dep_station}{arr_station}_{slot_dt_str}"
-
-                route = FlightRoute(
-                    segments=[
-                        FlightSegment(
-                            airline="W6",
-                            airline_name="Wizz Air",
-                            flight_no="W6",
-                            origin=dep_station,
-                            destination=arr_station,
-                            departure=dep_dt,
-                            arrival=dep_dt,  # timetableV2 has no arrival time
-                            cabin_class=cabin_class,
-                        )
-                    ],
-                    total_duration_seconds=0,
-                    stopovers=0,
+                if dep_dt.year == 2000:
+                    continue  # unparseable timestamp
+                dur_s = _estimate_duration_s(dep_station, arr_station)
+                arr_dt = dep_dt + timedelta(seconds=dur_s)
+                seg = FlightSegment(
+                    airline="W6",
+                    airline_name="Wizz Air",
+                    flight_no="",
+                    origin=dep_station,
+                    destination=arr_station,
+                    departure=dep_dt,
+                    arrival=arr_dt,
+                    duration_seconds=dur_s,
+                    cabin_class=cabin_class,
                 )
-                results.append(
-                    {
-                        "price": float(amount),
-                        "currency": currency,
-                        "key": key,
-                        "route": route,
-                        "cheapest": slot.get("isCheapestOfTheDay", False),
-                    }
-                )
+                route = FlightRoute(segments=[seg], total_duration_seconds=dur_s, stopovers=0)
+                key = hashlib.md5(f"{dep_station}{arr_station}{slot_dt_str}{amount}".encode()).hexdigest()[:12]
+                results.append({
+                    "route": route,
+                    "price": float(amount),
+                    "currency": currency,
+                    "key": key,
+                })
 
         return results
 

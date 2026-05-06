@@ -26,7 +26,7 @@ import asyncio
 import hashlib
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from curl_cffi.requests import AsyncSession
@@ -39,6 +39,7 @@ from ..models.flights import (
     FlightSegment,
 )
 from .browser import get_curl_cffi_proxies
+from .seat_prices import _route_distance_km
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,17 @@ IATA_TO_CITY = {
     "BOM": "BOM", "DEL": "DEL",
     "SFO": "SFO", "LAX": "LAX",
 }
+
+
+def _estimate_duration_s(origin: str, dest: str) -> int:
+    """Estimate one-way block time in seconds from great-circle distance."""
+    km = _route_distance_km(origin, dest)
+    if km < 1000:
+        return int(km / 750 * 3600) + 1800
+    elif km < 4000:
+        return int(km / 800 * 3600) + 2700
+    else:
+        return int(km / 850 * 3600) + 3600
 
 
 class LHGroupBaseConnector:
@@ -160,15 +172,7 @@ class LHGroupBaseConnector:
             if price <= 0:
                 return self._empty(req)
 
-            elapsed = time.monotonic() - t0
-            logger.info(
-                "%s %s→%s: %.0f %s (fare teaser) in %.1fs",
-                self.AIRLINE_NAME, req.origin, req.destination,
-                price, currency, elapsed,
-            )
-
             offer = self._build_offer(req, price, currency, target_offer)
-
             fid = hashlib.md5(
                 f"{self.AIRLINE_CODE}{req.origin}{req.destination}"
                 f"{req.date_from}{price}".encode()
@@ -213,6 +217,9 @@ class LHGroupBaseConnector:
             else dep_date
         )
 
+        dur_s = _estimate_duration_s(req.origin, req.destination)
+        arr_dt = dep_dt + timedelta(seconds=dur_s)
+
         segment = FlightSegment(
             airline=self.AIRLINE_CODE,
             airline_name=self.AIRLINE_NAME,
@@ -220,14 +227,14 @@ class LHGroupBaseConnector:
             origin=req.origin,
             destination=req.destination,
             departure=dep_dt,
-            arrival=dep_dt,
-            duration_seconds=0,
+            arrival=arr_dt,
+            duration_seconds=dur_s,
             cabin_class="economy",
         )
 
         route = FlightRoute(
             segments=[segment],
-            total_duration_seconds=0,
+            total_duration_seconds=dur_s,
             stopovers=0,
         )
 

@@ -21,7 +21,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from curl_cffi import requests as creq
@@ -34,6 +34,7 @@ from ..models.flights import (
     FlightSegment,
 )
 from .browser import get_curl_cffi_proxies
+from .seat_prices import _route_distance_km
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,17 @@ _EM_API_KEY = "HeQpRjsFI5xlAaSx2onkjc1HTK0ukqA1IrVvd5fvaMhNtzLTxInTpeYB1MK93pah"
 # Module-level cache for dynamically fetched slugs
 _slug_cache: dict[str, str] = {}
 _slug_cache_loaded = False
+
+
+def _estimate_duration_s(origin: str, dest: str) -> int:
+    """Estimate one-way block time in seconds from great-circle distance."""
+    km = _route_distance_km(origin, dest)
+    if km < 1000:
+        return int(km / 750 * 3600) + 1800
+    elif km < 4000:
+        return int(km / 800 * 3600) + 2700
+    else:
+        return int(km / 850 * 3600) + 3600
 
 
 def _load_slug_cache_sync() -> None:
@@ -284,6 +296,7 @@ class KlmConnectorClient:
                         _ret = req.return_from
                         _ret_dt = datetime.combine(_ret, datetime.min.time()) if not isinstance(_ret, datetime) else _ret
                         _kl_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
+                        _ib_dur_s = _estimate_duration_s(req.destination, req.origin)
                         _ib_seg = FlightSegment(
                             airline="KL",
                             airline_name="KLM Royal Dutch Airlines",
@@ -291,11 +304,11 @@ class KlmConnectorClient:
                             origin=req.destination,
                             destination=req.origin,
                             departure=_ret_dt,
-                            arrival=_ret_dt,
-                            duration_seconds=0,
+                            arrival=_ret_dt + timedelta(seconds=_ib_dur_s),
+                            duration_seconds=_ib_dur_s,
                             cabin_class=_kl_cabin,
                         )
-                        _ib_route = FlightRoute(segments=[_ib_seg], total_duration_seconds=0, stopovers=0)
+                        _ib_route = FlightRoute(segments=[_ib_seg], total_duration_seconds=_ib_dur_s, stopovers=0)
                         for _i, _o in enumerate(offers):
                             offers[_i] = FlightOffer(
                                 id=f"rt_{_o.id}",
@@ -427,11 +440,15 @@ class KlmConnectorClient:
         origin_code = fare.get("originAirportCode") or req.origin
         dest_code = fare.get("destinationAirportCode") or req.destination
         cabin = (fare.get("formattedTravelClass") or "Economy").lower()
+        kl_cabin = {"business": "business", "premium economy": "premium_economy", "first": "first"}.get(cabin, "economy")
 
         try:
-            dep_dt = datetime.strptime(dep_date_str, "%Y-%m-%d")
+            dep_dt = datetime.fromisoformat(dep_date_str + "T10:00:00")
         except ValueError:
-            dep_dt = datetime(2000, 1, 1)
+            return None
+
+        dur_s = _estimate_duration_s(origin_code, dest_code)
+        arr_dt = dep_dt + timedelta(seconds=dur_s)
 
         seg = FlightSegment(
             airline="KL",
@@ -439,14 +456,12 @@ class KlmConnectorClient:
             flight_no="",
             origin=origin_code,
             destination=dest_code,
-            origin_city="",
-            destination_city="",
             departure=dep_dt,
-            arrival=dep_dt,
-            duration_seconds=0,
-            cabin_class=cabin,
+            arrival=arr_dt,
+            duration_seconds=dur_s,
+            cabin_class=kl_cabin,
         )
-        route = FlightRoute(segments=[seg], total_duration_seconds=0, stopovers=0)
+        route = FlightRoute(segments=[seg], total_duration_seconds=dur_s, stopovers=0)
 
         fid = hashlib.md5(
             f"kl_{origin_code}{dest_code}{dep_date_str}{price_f}{cabin}".encode()

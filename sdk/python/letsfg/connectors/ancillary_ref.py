@@ -959,12 +959,12 @@ def apply_ref_ancillaries(offer: Any) -> None:  # offer: FlightOffer (avoid circ
                 note = f"1 cabin bag included{kg_str}"
             else:
                 kg_str = f", {kg} kg" if kg else ""
-                note = f"cabin bag: add-on (price varies by route{kg_str})"
+                note = f"cabin bag: from ~{val} {curr}{kg_str}"
         offer.conditions["carry_on"] = note
-        # Only mark as 0.0 (included free) — non-zero static estimates must NOT
-        # go into bags_price because they are not real per-flight prices.
-        if "carry_on" not in offer.bags_price and ref.get("carry_on") == 0.0:
-            offer.bags_price["carry_on"] = 0.0
+        if "carry_on" not in offer.bags_price:
+            carry_on_val = ref.get("carry_on")
+            if carry_on_val is not None:  # None means price varies — omit
+                offer.bags_price["carry_on"] = carry_on_val
 
     # ── Checked bag ─────────────────────────────────────────────────────────
     if "checked_bag" not in offer.conditions:
@@ -977,10 +977,12 @@ def apply_ref_ancillaries(offer: Any) -> None:  # offer: FlightOffer (avoid circ
             elif val == 0.0:
                 note = f"1 checked bag ({kg} kg) included"
             else:
-                note = f"checked bag: add-on (price varies by route, {kg} kg)"
+                note = f"checked bag: from ~{val} {curr} ({kg} kg)"
         offer.conditions["checked_bag"] = note
-        if "checked_bag" not in offer.bags_price and ref.get("checked_bag") == 0.0:
-            offer.bags_price["checked_bag"] = 0.0
+        if "checked_bag" not in offer.bags_price:
+            checked_val = ref.get("checked_bag")
+            if checked_val is not None:  # None means price varies — omit
+                offer.bags_price["checked_bag"] = checked_val
 
     # ── Seat selection ───────────────────────────────────────────────────────
     if "seat" not in offer.conditions:
@@ -990,7 +992,7 @@ def apply_ref_ancillaries(offer: Any) -> None:  # offer: FlightOffer (avoid circ
         elif val == 0.0:
             note = "seat selection: free (assigned at check-in)"
         else:
-            note = "seat selection: add-on (price varies by route)"
+            note = f"seat selection: from ~{val} {curr}"
         offer.conditions["seat"] = note
-        if "seat_selection" not in offer.bags_price and val == 0.0:
-            offer.bags_price["seat_selection"] = 0.0
+        if "seat_selection" not in offer.bags_price and val is not None:
+            offer.bags_price["seat_selection"] = val
