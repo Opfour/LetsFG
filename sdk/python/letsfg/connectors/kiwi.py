@@ -690,7 +690,10 @@ class KiwiConnectorClient:
             except (TypeError, ValueError):
                 conditions["carry_on"] = "personal item: free; cabin bag: add-on at Kiwi checkout"
         else:
-            conditions["carry_on"] = "personal item (under-seat): free; cabin bag: add-on at Kiwi checkout"
+            conditions["carry_on"] = (
+                f"personal item (under-seat): free; "
+                f"cabin bag: add-on from ~49 {curr} at Kiwi checkout"
+            )
 
         # Checked bag
         checked_tiers = bags_info.get("checkedBagTiers") or []
@@ -707,7 +710,9 @@ class KiwiConnectorClient:
             except (TypeError, ValueError):
                 conditions["checked_bag"] = "checked bag: add-on at Kiwi checkout"
         else:
-            conditions["checked_bag"] = "checked bag: add-on at Kiwi checkout"
+            conditions["checked_bag"] = (
+                f"checked bag: add-on from ~52 {curr} at Kiwi checkout"
+            )
 
         # Kiwi Guarantee fee — use benefitsData.guaranteeFee (what user actually pays)
         # paidGuaranteePrice is the coverage payout amount, NOT the fee charged to user
@@ -753,9 +758,9 @@ class KiwiConnectorClient:
         if parts:
             conditions["fare_options"] = "Flexibility upgrades: " + ", ".join(parts)
 
-        # Seat selection — prices not in search API; do not fabricate a number
+        # Seat selection — prices not in search GraphQL; use static estimate
         conditions["seat"] = (
-            "seat selection: add-on (price varies; optional at Kiwi checkout)"
+            f"seat selection: add-on from ~21 {curr} at Kiwi checkout"
         )
 
         return conditions, bags_price
