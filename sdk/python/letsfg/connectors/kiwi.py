@@ -231,9 +231,32 @@ class KiwiConnectorClient:
         "CZK": "cz", "HUF": "hu", "SEK": "se", "NOK": "no",
         "DKK": "dk", "CHF": "ch", "RON": "ro", "BGN": "bg",
         "HRK": "hr", "TRY": "tr", "RUB": "ru", "UAH": "ua",
+        "CAD": "ca", "AUD": "au", "NZD": "nz",
     }
 
-    def _guess_market(self, currency: str) -> str:
+    # Override market by origin airport country — takes priority over currency.
+    # Critical for routes to Cuba: USD currency → market "us" filters HAV;
+    # Canadian-origin searches must use market "ca" to see Cuba routes.
+    _ORIGIN_COUNTRY_MARKET: dict[str, str] = {
+        "CA": "ca", "AU": "au", "NZ": "nz", "GB": "gb",
+        "DE": "de", "FR": "fr", "PL": "pl", "CZ": "cz",
+    }
+    _IATA_COUNTRY: dict[str, str] = {
+        "YYZ": "CA", "YVR": "CA", "YUL": "CA", "YYC": "CA", "YOW": "CA",
+        "YEG": "CA", "YHZ": "CA", "YWG": "CA", "YTZ": "CA", "YQB": "CA",
+        "YQG": "CA", "YXU": "CA", "YKF": "CA", "YHM": "CA",
+        "SYD": "AU", "MEL": "AU", "BNE": "AU", "PER": "AU",
+        "AKL": "NZ", "WLG": "NZ", "CHC": "NZ",
+    }
+
+    def _guess_market(self, currency: str, origin: str = "") -> str:
+        # Origin-country override takes priority (avoids US market filtering Cuba etc.)
+        if origin:
+            country = self._IATA_COUNTRY.get(origin.upper())
+            if country:
+                market = self._ORIGIN_COUNTRY_MARKET.get(country)
+                if market:
+                    return market
         return self._CURRENCY_MARKET.get(currency.upper(), "gb")
 
     async def _resolve_slug(self, iata: str) -> str:
@@ -357,7 +380,7 @@ class KiwiConnectorClient:
             "options": {
                 "currency": req.currency.lower(),
                 "locale": req.locale.split("-")[0] if req.locale else "en",
-                "market": self._guess_market(req.currency),
+                "market": self._guess_market(req.currency, req.origin),
                 "partner": "skypicker",
                 "sortBy": "PRICE",
             },
@@ -616,6 +639,27 @@ class KiwiConnectorClient:
 
         itineraries = result.get("itineraries", [])
         total = result.get("metadata", {}).get("itinerariesCount", len(itineraries))
+        has_more_pending = result.get("metadata", {}).get("hasMorePending", False)
+
+        # Kiwi sometimes returns hasMorePending=true with 0 results when it's still
+        # computing itineraries for uncommon routes (e.g. small regional airports).
+        # Poll once after a short delay to pick up results.
+        if not itineraries and has_more_pending:
+            logger.debug("Kiwi.com %s→%s hasMorePending — polling once", req.origin, req.destination)
+            await asyncio.sleep(1.5)
+            try:
+                resp2 = await client.post(
+                    f"{KIWI_GRAPHQL_URL}?featureName={feature}",
+                    json={"query": query, "variables": variables},
+                )
+                if resp2.status_code == 200:
+                    raw2 = resp2.json()
+                    result2 = (raw2.get("data") or {}).get(root_key, {})
+                    if result2 and result2.get("__typename") != "AppError":
+                        itineraries = result2.get("itineraries") or itineraries
+                        total = result2.get("metadata", {}).get("itinerariesCount", len(itineraries))
+            except Exception as _poll_exc:
+                logger.debug("Kiwi.com poll failed: %s", _poll_exc)
 
         logger.info(
             "Kiwi.com %s→%s returned %d offers (total %d) in %.1fs",

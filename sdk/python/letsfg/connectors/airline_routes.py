@@ -199,6 +199,7 @@ AIRPORT_COUNTRY: dict[str, str] = {
     "HNL": "US", "ANC": "US", "ABQ": "US", "ELP": "US",
     "YYZ": "CA", "YVR": "CA", "YUL": "CA", "YOW": "CA", "YYC": "CA",
     "YEG": "CA", "YHZ": "CA", "YWG": "CA", "YTZ": "CA", "YQB": "CA",
+    "YQG": "CA", "YXU": "CA", "YKF": "CA", "YHM": "CA",
     # Mexico & Central America
     "MEX": "MX", "CUN": "MX", "GDL": "MX", "MTY": "MX", "TIJ": "MX",
     "SJD": "MX", "PVR": "MX", "MID": "MX", "BJX": "MX",
