@@ -77,10 +77,14 @@ class AzerbaijanairlinesConnectorClient:
         days_from_now = (dt - date.today()).days
         if days_from_now < 1: days_from_now = 1
         is_rt = bool(req.return_from)
-        payload = {"origins": [req.origin], "destinations": [req.destination], "departureDaysInterval": {"min": max(0, days_from_now - 7), "max": days_from_now + 14}, "journeyType": "ROUND_TRIP" if is_rt else "ONE_WAY"}
+        payload = {"origins": [req.origin], "destinations": [req.destination], "departureDaysInterval": {"min": max(0, days_from_now - 7), "max": days_from_now + 14}, "journeyType": "ROUND_TRIP" if is_rt else "ONE_WAY", "cabinClass": {"M": "Economy", "W": "PremiumEconomy", "C": "Business", "F": "First"}.get(req.cabin_class or "M", "Economy")}
         fares = await self._call_sputnik(payload)
         offers = [o for o in (self._build_offer(f, req) for f in fares) if o is not None]
         offers = [o for o in offers if o.outbound and o.outbound.segments and o.outbound.segments[0].departure.date() == dt]
+        if req.cabin_class and req.cabin_class != "M":
+            _ck = {"W": "premium", "C": "business", "F": "first"}.get(req.cabin_class, "")
+            if _ck:
+                offers = [o for o in offers if _ck in (o.outbound.segments[0].cabin_class or "").lower()]
         offers.sort(key=lambda o: o.price)
         elapsed = time.monotonic() - t0
         logger.info("Azerbaijan Airlines %s->%s: %d offers in %.1fs", req.origin, req.destination, len(offers), elapsed)

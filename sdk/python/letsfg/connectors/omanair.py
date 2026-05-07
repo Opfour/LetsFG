@@ -95,6 +95,7 @@ class OmanairConnectorClient:
                 "max": days_from_now + 7,
             },
             "journeyType": "ROUND_TRIP" if is_rt else "ONE_WAY",
+            "cabinClass": {"M": "Economy", "W": "PremiumEconomy", "C": "Business", "F": "First"}.get(req.cabin_class or "M", "Economy"),
         }
 
         fares = await self._call_sputnik(payload)
@@ -103,6 +104,10 @@ class OmanairConnectorClient:
         ]
         _td = req.date_from.date() if isinstance(req.date_from, datetime) else req.date_from
         offers = [o for o in offers if o.outbound and o.outbound.segments and o.outbound.segments[0].departure.date() == _td]
+        if req.cabin_class and req.cabin_class != "M":
+            _ck = {"W": "premium", "C": "business", "F": "first"}.get(req.cabin_class, "")
+            if _ck:
+                offers = [o for o in offers if _ck in (o.outbound.segments[0].cabin_class or "").lower()]
         offers.sort(key=lambda o: o.price)
 
         elapsed = time.monotonic() - t0

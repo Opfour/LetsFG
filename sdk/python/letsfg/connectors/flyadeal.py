@@ -68,6 +68,10 @@ class FlyadealConnectorClient:
         return ob_result
 
     async def _search_ow(self, req: FlightSearchRequest) -> FlightSearchResponse:
+        # flyadeal is economy-only
+        if req.cabin_class and req.cabin_class != "M":
+            return self._empty(req)
+
         t0 = time.monotonic()
 
         try:
