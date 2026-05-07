@@ -265,7 +265,9 @@ class AviasalesConnectorClient:
             # Use deep-link format: /search/{ORIGIN}{DDMM}{DEST}{adults}
             # e.g. /search/LON1506BCN1  (LON, June 15, BCN, 1 adult)
             adults = req.adults or 1
-            deep_url = f"{_BASE}/search/{req.origin}{date_ddmm}{req.destination}{adults}"
+            # trip_class: 0=economy, 1=business, 2=first
+            _av_trip_class = {"M": "0", "W": "0", "C": "1", "F": "2"}.get(req.cabin_class or "M", "0")
+            deep_url = f"{_BASE}/search/{req.origin}{date_ddmm}{req.destination}{adults}?trip_class={_av_trip_class}"
             logger.info("Aviasales: navigating to deep-link %s", deep_url)
             await page.goto(deep_url, wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
             await asyncio.sleep(3.0)  # Aviasales needs more time to init search

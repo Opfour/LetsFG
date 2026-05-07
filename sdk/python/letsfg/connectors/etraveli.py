@@ -292,6 +292,23 @@ class TravelgenioConnectorClient(EtraveliConnectorClient):
 # ---------------------------------------------------------------------------
 
 
+_GOTOGATE_CABIN_MAP = {
+    "ECONOMY": "economy",
+    "PREMIUM_ECONOMY": "premium_economy",
+    "PREMIUMECONOMY": "premium_economy",
+    "BUSINESS": "business",
+    "FIRST": "first",
+    "FIRST_CLASS": "first",
+}
+
+_CABIN_CODE_MAP = {
+    "M": "economy",
+    "W": "premium_economy",
+    "C": "business",
+    "F": "first",
+}
+
+
 def _parse_gotogate(
     flights: list[dict],
     req: FlightSearchRequest,
@@ -299,6 +316,7 @@ def _parse_gotogate(
     is_rt: bool,
 ) -> list[FlightOffer]:
     """Parse Gotogate GraphQL search response into FlightOffer list."""
+    target_cabin = _CABIN_CODE_MAP.get(req.cabin_class or "M", "economy")
     offers: list[FlightOffer] = []
 
     for trip in flights:
@@ -327,13 +345,21 @@ def _parse_gotogate(
             if not bounds:
                 continue
 
-            outbound = _parse_bound(bounds[0], req.origin, req.destination)
+            outbound = _parse_bound(bounds[0], req.origin, req.destination, target_cabin)
             if not outbound:
                 continue
 
+            # Post-filter: skip offers that don't match the requested cabin.
+            # cabinClassName is read from each segment in _parse_bound; if the
+            # API returned economy segments for a business search, drop the offer.
+            if req.cabin_class and req.cabin_class != "M":
+                ob_cabins = {s.cabin_class for s in outbound.segments if s.cabin_class}
+                if ob_cabins and target_cabin not in ob_cabins:
+                    continue
+
             inbound = None
             if is_rt and len(bounds) > 1:
-                inbound = _parse_bound(bounds[1], req.destination, req.origin)
+                inbound = _parse_bound(bounds[1], req.destination, req.origin, target_cabin)
 
             # --- Airlines ---
             all_segs = outbound.segments + (inbound.segments if inbound else [])
@@ -370,7 +396,8 @@ def _parse_gotogate(
 
 
 def _parse_bound(
-    bound: dict, fallback_origin: str, fallback_dest: str
+    bound: dict, fallback_origin: str, fallback_dest: str,
+    fallback_cabin: str = "economy",
 ) -> FlightRoute | None:
     """Parse a single bound (outbound or inbound) into FlightRoute."""
     raw_segs = bound.get("segments") or []
@@ -393,6 +420,9 @@ def _parse_bound(
         orig = (seg.get("origin") or {}).get("code") or fallback_origin
         dest = (seg.get("destination") or {}).get("code") or fallback_dest
 
+        raw_cabin = (seg.get("cabinClassName") or "").upper().replace(" ", "_")
+        cabin_class = _GOTOGATE_CABIN_MAP.get(raw_cabin, fallback_cabin)
+
         segments.append(
             FlightSegment(
                 airline=carrier_code,
@@ -401,6 +431,7 @@ def _parse_bound(
                 destination=dest,
                 departure=_parse_dt(seg.get("departuredAt")),
                 arrival=_parse_dt(seg.get("arrivedAt")),
+                cabin_class=cabin_class,
             )
         )
 

@@ -63,6 +63,9 @@ class SkiplaggedConnectorClient:
             await self._http.aclose()
 
     async def search_flights(self, req: FlightSearchRequest) -> FlightSearchResponse:
+        # Skiplagged only offers economy (hidden-city) fares
+        if req.cabin_class and req.cabin_class != "M":
+            return FlightSearchResponse(search_id="fs_skip_empty", origin=req.origin, destination=req.destination, currency="USD", offers=[], total_results=0)
         ob_result = await self._search_ow(req)
         if req.return_from and ob_result.total_results > 0:
             ib_req = req.model_copy(update={"origin": req.destination, "destination": req.origin, "date_from": req.return_from, "return_from": None})

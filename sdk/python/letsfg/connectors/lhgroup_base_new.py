@@ -98,6 +98,11 @@ class LHGroupBaseConnector:
         pass  # No persistent resources
 
     async def search_flights(self, req: FlightSearchRequest) -> FlightSearchResponse:
+        # Fare teaser API only returns indicative economy starting prices.
+        # Returning economy prices labeled as business/first would be misleading.
+        if req.cabin_class and req.cabin_class != "M":
+            return self._empty(req)
+
         t0 = time.monotonic()
 
         dest_city = IATA_TO_CITY.get(req.destination, req.destination)
@@ -220,6 +225,7 @@ class LHGroupBaseConnector:
         dur_s = _estimate_duration_s(req.origin, req.destination)
         arr_dt = dep_dt + timedelta(seconds=dur_s)
 
+        _cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
         segment = FlightSegment(
             airline=self.AIRLINE_CODE,
             airline_name=self.AIRLINE_NAME,
@@ -229,7 +235,7 @@ class LHGroupBaseConnector:
             departure=dep_dt,
             arrival=arr_dt,
             duration_seconds=dur_s,
-            cabin_class="economy",
+            cabin_class=_cabin,
         )
 
         route = FlightRoute(

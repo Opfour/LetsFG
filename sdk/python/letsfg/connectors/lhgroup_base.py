@@ -196,6 +196,12 @@ class LHGroupBaseConnector:
         pass
 
     async def search_flights(self, req: FlightSearchRequest) -> FlightSearchResponse:
+        # This connector scrapes economy-only JSON-LD route pages.
+        # Returning economy prices labeled as business/first would be misleading;
+        # OTA connectors (Kiwi, Skyscanner, etc.) handle non-economy cabin searches.
+        if req.cabin_class and req.cabin_class != "M":
+            return self._empty(req)
+
         t0 = time.monotonic()
 
         origin_slug = IATA_TO_SLUG.get(req.origin)

@@ -343,12 +343,36 @@ def _parse(data: dict, req: FlightSearchRequest) -> list[FlightOffer]:
             if price <= 0:
                 continue
 
-            cabin = "Economy"
             avail = ab.get("availabilityDetails", [])
             if avail and avail[0].get("cabin") == "bus":
-                cabin = "Business"
+                cabin_label = "Business"
+                cabin_class = "business"
+            else:
+                cabin_label = "Economy"
+                cabin_class = "economy"
             seats = avail[0].get("quota", 0) if avail else 0
             fare_family = ab.get("fareFamilyCode", "")
+
+            # Annotate segments with detected cabin class
+            seg_with_cabin = [
+                FlightSegment(
+                    airline=s.airline,
+                    airline_name=s.airline_name,
+                    flight_no=s.flight_no,
+                    origin=s.origin,
+                    destination=s.destination,
+                    departure=s.departure,
+                    arrival=s.arrival,
+                    duration_seconds=s.duration_seconds,
+                    cabin_class=cabin_class,
+                )
+                for s in segments
+            ]
+            annotated_route = FlightRoute(
+                segments=seg_with_cabin,
+                total_duration_seconds=route.total_duration_seconds,
+                stopovers=route.stopovers,
+            )
 
             key = f"pg_{segments[0].flight_no}_{fare_family}_{price}"
             oid = hashlib.md5(key.encode()).hexdigest()[:12]
@@ -363,12 +387,12 @@ def _parse(data: dict, req: FlightSearchRequest) -> list[FlightOffer]:
                 price=round(float(price), 2),
                 currency=currency,
                 price_formatted=f"{price:.0f} {currency}",
-                outbound=route,
+                outbound=annotated_route,
                 inbound=None,
                 airlines=["Bangkok Airways"],
                 owner_airline="PG",
                 conditions={
-                    "cabin": cabin,
+                    "cabin": cabin_label,
                     "fare_family": fare_family,
                     "seats_left": str(seats),
                 },
@@ -377,6 +401,13 @@ def _parse(data: dict, req: FlightSearchRequest) -> list[FlightOffer]:
                 source="bangkokairways_direct",
                 source_tier="free",
             ))
+
+    # Filter by requested cabin class
+    requested_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
+    if req.cabin_class and req.cabin_class != "M":
+        offers = [o for o in offers if o.outbound and any(
+            s.cabin_class == requested_cabin for s in o.outbound.segments
+        )]
 
     return offers
 

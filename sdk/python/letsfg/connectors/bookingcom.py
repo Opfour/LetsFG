@@ -326,6 +326,31 @@ class BookingcomConnectorClient:
         except Exception:
             pass
 
+        # Select cabin class (before filling origin/dest so the form state is set)
+        if req.cabin_class and req.cabin_class != "M":
+            _bc_cabin_label = {"W": "Premium Economy", "C": "Business", "F": "First"}.get(req.cabin_class)
+            if _bc_cabin_label:
+                try:
+                    # Booking.com flights cabin selector is typically a dropdown/button
+                    cabin_btn = page.locator(
+                        '[data-ui-name*="cabin"], [data-testid*="cabin"], '
+                        'button:has-text("Economy"), [aria-label*="cabin"], [aria-label*="Cabin"]'
+                    )
+                    if await cabin_btn.count() > 0:
+                        await cabin_btn.first.click(timeout=3000)
+                        await asyncio.sleep(0.5)
+                        opt = page.locator(
+                            f'[role="option"]:has-text("{_bc_cabin_label}"), '
+                            f'li:has-text("{_bc_cabin_label}"), '
+                            f'button:has-text("{_bc_cabin_label}")'
+                        )
+                        if await opt.count() > 0:
+                            await opt.first.click(timeout=2000)
+                            await asyncio.sleep(0.3)
+                            logger.debug("BookingCom: cabin class set to %s", _bc_cabin_label)
+                except Exception as e:
+                    logger.debug("BookingCom: cabin class selection failed: %s", e)
+
         # Origin — the field is a <button>, click to reveal input
         try:
             from_btn = page.locator('[data-ui-name="input_location_from_segment_0"]')

@@ -186,9 +186,11 @@ class DespegarConnectorClient:
         adults = req.adults or 1
         children = req.children or 0
         infants = req.infants or 0
+        _desp_cabin = {"M": "economy", "W": "premium", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
         search_url = (
             f"https://www.despegar.com.ar/shop/flights/results/oneway/"
             f"{req.origin}/{req.destination}/{date_str}/{adults}/{children}/{infants}"
+            f"/{_desp_cabin}"
         )
 
         await acquire_browser_slot()

@@ -327,6 +327,32 @@ class FlightcatchersConnectorClient:
         except Exception:
             pass
 
+        # Cabin class — vibe.travel form has a class selector
+        if req.cabin_class and req.cabin_class != "M":
+            _fc_cabin_label = {"W": "Premium Economy", "C": "Business", "F": "First Class"}.get(req.cabin_class)
+            if _fc_cabin_label:
+                try:
+                    cabin_sel = page.locator(
+                        '#searchbox_sb3_cc_flightonly_sb3_flight_cabinClass, '
+                        'select[name*="cabin" i], select[name*="class" i], '
+                        '[data-field="cabinClass"]'
+                    )
+                    if await cabin_sel.count() > 0:
+                        await cabin_sel.first.select_option(label=_fc_cabin_label)
+                        await asyncio.sleep(0.3)
+                        logger.debug("Flightcatchers: cabin class set to %s", _fc_cabin_label)
+                    else:
+                        # Try dropdown button
+                        cabin_btn = page.locator('button:has-text("Economy"), [aria-label*="class" i]')
+                        if await cabin_btn.count() > 0:
+                            await cabin_btn.first.click(timeout=2000)
+                            await asyncio.sleep(0.3)
+                            opt = page.locator(f'[role="option"]:has-text("{_fc_cabin_label}"), li:has-text("{_fc_cabin_label}")')
+                            if await opt.count() > 0:
+                                await opt.first.click(timeout=2000)
+                except Exception as e:
+                    logger.debug("Flightcatchers: cabin class selection failed: %s", e)
+
         # Submit — try multiple selectors for the search button
         try:
             submit = page.locator(

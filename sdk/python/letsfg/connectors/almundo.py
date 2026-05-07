@@ -292,10 +292,11 @@ class AlmundoConnectorClient:
 
             # Almundo URL format
             dep = req.date_from.strftime("%Y-%m-%d")
+            _alm_cabin = {"M": "economy", "W": "premium", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
             url = (
                 f"https://www.almundo.com.ar/flights/results"
                 f"/oneway/{req.origin}/{req.destination}/{dep}"
-                f"/{req.adults or 1}/{req.children or 0}/0"
+                f"/{req.adults or 1}/{req.children or 0}/0/{_alm_cabin}"
             )
             if req.return_from:
                 ret = req.return_from.strftime("%Y-%m-%d")
@@ -303,7 +304,7 @@ class AlmundoConnectorClient:
                     f"https://www.almundo.com.ar/flights/results"
                     f"/roundtrip/{req.origin}/{req.destination}"
                     f"/{dep}/{ret}"
-                    f"/{req.adults or 1}/{req.children or 0}/0"
+                    f"/{req.adults or 1}/{req.children or 0}/0/{_alm_cabin}"
                 )
 
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)

@@ -111,7 +111,7 @@ def _parse_item_id(item_id: str, search_date: datetime) -> list[dict]:
 
 
 def _build_route_from_item(
-    item_id: str, search_date: datetime
+    item_id: str, search_date: datetime, cabin_class: str = "economy"
 ) -> FlightRoute | None:
     segs = _parse_item_id(item_id, search_date)
     if not segs:
@@ -133,6 +133,7 @@ def _build_route_from_item(
             departure=dep,
             arrival=arr,
             duration_seconds=dur,
+            cabin_class=cabin_class,
         ))
     if not flight_segments:
         return {
@@ -191,9 +192,23 @@ def _extract_offers(
                 continue
 
             airline_code = itin.get("ValidatingAirline", "")
-            cabin = itin.get("CabinClass", "Economy class")
+            cabin_raw = itin.get("CabinClass", "Economy class").lower()
+            # Normalise Musafir CabinClass → internal code
+            if "business" in cabin_raw:
+                itin_cabin = "business"
+            elif "first" in cabin_raw:
+                itin_cabin = "first"
+            elif "premium" in cabin_raw:
+                itin_cabin = "premium_economy"
+            else:
+                itin_cabin = "economy"
 
-            outbound = _build_route_from_item(item_id, search_date)
+            # Filter by requested cabin class
+            _req_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
+            if _req_cabin != "economy" and itin_cabin != _req_cabin:
+                continue
+
+            outbound = _build_route_from_item(item_id, search_date, itin_cabin)
             if not outbound:
                 continue
 

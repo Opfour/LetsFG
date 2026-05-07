@@ -154,11 +154,14 @@ class PricelineConnectorClient:
             dep_date = req.date_from.strftime("%Y%m%d")
             dep_iso = req.date_from.isoformat()
             adults = req.adults or 1
+            _pcl_cabin = {"M": "e", "W": "p", "C": "b", "F": "f"}
+            cabin = _pcl_cabin.get(req.cabin_class or "M", "e")
 
             # Priceline URL pattern: /m/fly/search/{ORIGIN}-{DEST}-{YYYYMMDD}/{PAX}
             url = (
                 f"https://www.priceline.com/m/fly/search/"
                 f"{req.origin}-{req.destination}-{dep_date}/{adults}"
+                f"?cabin={cabin}"
             )
             if req.return_from:
                 ret_date = req.return_from.strftime("%Y%m%d")
@@ -166,6 +169,7 @@ class PricelineConnectorClient:
                     f"https://www.priceline.com/m/fly/search/"
                     f"{req.origin}-{req.destination}-{dep_date}/"
                     f"{req.destination}-{req.origin}-{ret_date}/{adults}"
+                    f"?cabin={cabin}"
                 )
 
             await page.goto(url, wait_until="domcontentloaded", timeout=25000)

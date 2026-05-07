@@ -221,6 +221,9 @@ class AirasiamoveConnectorClient:
     async def search_flights(
         self, req: FlightSearchRequest
     ) -> FlightSearchResponse:
+        # AirAsia core routes are economy-only; AirAsia X business is handled by airasiax.py
+        if req.cabin_class and req.cabin_class not in ("M", "W"):
+            return self._empty(req)
         ob_result = await self._search_ow(req)
         if req.return_from and ob_result.total_results > 0:
             ib_req = req.model_copy(update={"origin": req.destination, "destination": req.origin, "date_from": req.return_from, "return_from": None})

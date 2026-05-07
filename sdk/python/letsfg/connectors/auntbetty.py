@@ -207,9 +207,11 @@ class AuntbettyConnectorClient:
             adults = req.adults if hasattr(req, 'adults') and req.adults else 1
             children = req.children if hasattr(req, 'children') and req.children else 0
             infants = req.infants if hasattr(req, 'infants') and req.infants else 0
+            # BYOjet/AuntBetty Class param: E=economy, B=business, F=first, P=premium economy
+            _ab_cabin = {"M": "E", "W": "P", "C": "B", "F": "F"}.get(req.cabin_class or "M", "E")
             deep_url = (
                 f"{_BOOKING}/#/au/search?"
-                f"Class=E&TotalAdults={adults}&TotalChildren={children}&TotalInfants={infants}"
+                f"Class={_ab_cabin}&TotalAdults={adults}&TotalChildren={children}&TotalInfants={infants}"
                 f"&Sort=0&OriginCode={req.origin}&DestinationCode={req.destination}"
                 f"&DepartMonth={month_param}&DepartDay={day_param}"
             )

@@ -331,6 +331,32 @@ class TravixConnectorClient:
         if not ok:
             return False
 
+        # Cabin class (BudgetAir has a class selector before search button)
+        if req.cabin_class and req.cabin_class != "M":
+            _tx_cabin_label = {"W": "Premium Economy", "C": "Business", "F": "First"}.get(req.cabin_class)
+            if _tx_cabin_label:
+                try:
+                    cabin_btn = page.locator(
+                        "[data-testid='searchbox.cabinClass'], "
+                        "[data-testid*='cabin'], "
+                        "button:has-text('Economy'), "
+                        "[aria-label*='cabin' i], [aria-label*='class' i]"
+                    )
+                    if await cabin_btn.count() > 0:
+                        await cabin_btn.first.click(timeout=3000)
+                        await asyncio.sleep(0.5)
+                        opt = page.locator(
+                            f"[role='option']:has-text('{_tx_cabin_label}'), "
+                            f"li:has-text('{_tx_cabin_label}'), "
+                            f"[data-testid*='{_tx_cabin_label.lower().replace(' ', '')}']"
+                        )
+                        if await opt.count() > 0:
+                            await opt.first.click(timeout=2000)
+                            await asyncio.sleep(0.3)
+                            logger.debug("Travix: cabin class set to %s", _tx_cabin_label)
+                except Exception as e:
+                    logger.debug("Travix: cabin class selection failed: %s", e)
+
         return True
 
     async def _fill_airport(self, page, field_type: str, iata: str) -> bool:

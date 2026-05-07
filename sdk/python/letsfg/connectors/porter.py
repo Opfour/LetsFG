@@ -356,33 +356,45 @@ class PorterConnectorClient:
 
                 seg_origin = req.destination if section == "inbound" else req.origin
                 seg_dest = req.origin if section == "inbound" else req.destination
-                seg = FlightSegment(
-                    airline="PD",
-                    airline_name="Porter Airlines",
-                    flight_no=flight_num,
-                    origin=seg_origin,
-                    destination=seg_dest,
-                    departure=dep_time,
-                    arrival=arr_time,
-                    duration_seconds=dur_sec,
-                )
-                route = FlightRoute(
-                    segments=[seg],
-                    stopovers=0 if nonstop else 1,
-                    total_duration_seconds=dur_sec,
-                )
 
                 for fare in f.get("fares", []):
                     price = fare.get("price", 0)
                     cat = fare.get("category", "Economy")
+                    # PorterClassic → business; everything else → economy
+                    if "classic" in cat.lower() or "business" in cat.lower():
+                        cabin_class = "business"
+                    else:
+                        cabin_class = "economy"
+                    seg = FlightSegment(
+                        airline="PD",
+                        airline_name="Porter Airlines",
+                        flight_no=flight_num,
+                        origin=seg_origin,
+                        destination=seg_dest,
+                        departure=dep_time,
+                        arrival=arr_time,
+                        duration_seconds=dur_sec,
+                        cabin_class=cabin_class,
+                    )
+                    fare_route = FlightRoute(
+                        segments=[seg],
+                        stopovers=0 if nonstop else 1,
+                        total_duration_seconds=dur_sec,
+                    )
                     offer_id = hashlib.md5(
                         f"PD-{flight_num}-{dep_time}-{cat}-{price}".encode()
                     ).hexdigest()[:12]
-                    entry = {"route": route, "price": price, "cat": cat, "offer_id": offer_id}
+                    entry = {"route": fare_route, "price": price, "cat": cat, "offer_id": offer_id, "cabin_class": cabin_class}
                     if section == "inbound":
                         ib_flights.append(entry)
                     else:
                         ob_flights.append(entry)
+
+            # Filter by requested cabin class
+            _pd_cabin = {"M": "economy", "W": "business", "C": "business", "F": "business"}.get(req.cabin_class or "M", "economy")
+            if req.cabin_class and req.cabin_class not in (None, "M"):
+                ob_flights = [e for e in ob_flights if e["cabin_class"] == _pd_cabin]
+                ib_flights = [e for e in ib_flights if e["cabin_class"] == _pd_cabin]
 
             # Build offers: pair OB x cheapest IB for RT, or emit OW
             if req.return_from and ob_flights and ib_flights:
